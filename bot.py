@@ -55,6 +55,7 @@ logging.basicConfig(
 )
 
 
+
 # =====================================================
 # INIT
 # =====================================================
@@ -89,13 +90,16 @@ post_lock = asyncio.Lock()
 gemini_lock = asyncio.Lock()
 
 
+
 # =====================================================
 # GEMINI SCHEMA
 # =====================================================
 
 class DailyPostSchema(BaseModel):
+
     holiday: str
     quote: str
+
 
 
 # =====================================================
@@ -106,11 +110,14 @@ async def init_db():
 
     global db_conn
 
+
     db_conn = await aiosqlite.connect(
         DB_PATH,
         timeout=30
     )
 
+
+    # Включаем WAL-режим корректно
     await db_conn.execute(
         "PRAGMA journal_mode=WAL;"
     )
@@ -149,7 +156,7 @@ async def init_db():
 
 
     logging.info(
-        "SQLite готова"
+        "SQLite готова в режиме WAL"
     )
 
 
@@ -177,6 +184,7 @@ async def save_message(
                 datetime.now(TZ).isoformat()
             )
         )
+
 
         await db_conn.commit()
 
@@ -207,9 +215,11 @@ async def get_recent_messages():
             rows = await cursor.fetchall()
 
 
+
     if not rows:
 
         return "В чате было спокойно."
+
 
 
     rows.reverse()
@@ -223,6 +233,7 @@ async def get_recent_messages():
     )
 
 
+    # защита лимита Gemini
     return result[-8000:]
 
 
@@ -299,7 +310,10 @@ async def save_post_today():
         )
 
 
-        await db_conn.commit()# =====================================================
+        await db_conn.commit()
+
+
+# =====================================================
 # COMMANDS
 # =====================================================
 
@@ -340,18 +354,22 @@ async def collect(
     message: types.Message
 ):
 
+    # только нужный чат
     if message.chat.id != CHAT_ID:
         return
 
 
+    # только текст
     if not message.text:
         return
 
 
+    # игнорируем команды
     if message.text.startswith("/"):
         return
 
 
+    # игнорируем ботов
     if (
         message.from_user
         and message.from_user.is_bot
@@ -361,10 +379,14 @@ async def collect(
 
 
     username = (
+
         message.from_user.first_name
+
         if message.from_user
         and message.from_user.first_name
+
         else "Участник"
+
     )
 
 
@@ -397,118 +419,58 @@ async def generate_text() -> dict:
 
     chat = await get_recent_messages()
 
-
-    current_date = datetime.now(TZ)
-
-    date_text = current_date.strftime(
-        "%d.%m.%Y"
-    )
+    current_date_str = datetime.now(TZ).strftime("%d.%m.%Y")
 
 
     prompt = f"""
 Ты — мудрый участник компании друзей из Иркутска.
-
-Создай утреннюю мысль дня на основе последних разговоров.
+Каждое утро создавай короткую мысль дня на основе последних разговоров.
 
 Дата:
-{date_text}
+{current_date_str}
 
-
-Разговоры:
+Последние разговоры:
 {chat}
 
+Правила для JSON полей (СТРОГО):
+- holiday: Напиши исключительно ОФИЦИАЛЬНЫЙ, общеизвестный реальный праздник или памятную дату, которая действительно выпадает на этот день ({current_date_str}) в мире или России. Категорически ЗАПРЕЩЕНО выдумывать шуточные или фейковые праздники на основе контекста разговоров (никаких дней гулей и т.д.).
+- quote: Мудрая короткая мысль (1-3 предложения) с лёгким юмором и иронией, которая тонко обыгрывает или учитывает настроение разговоров в чате. Вот здесь ты можешь шутить, подкалывать и иронизировать над темами из разговоров.
 
-Верни строго JSON:
-
-{{
-"holiday": "праздник или памятная дата",
-"quote": "короткая мудрая мысль"
-}}
-
-
-ВАЖНЫЕ ПРАВИЛА ДЛЯ holiday:
-
-- Пиши только настоящий официальный праздник.
-- Не выдумывай праздники.
-- Не используй контекст чата для создания праздника.
-- Запрещены варианты:
-  "Иркутское утро",
-  "День Иркутска",
-  "День хорошего настроения",
-  "День чата",
-  "День друзей",
-  любые придуманные названия.
-
-Если нет известного официального праздника на эту дату,
-пиши:
-
-"Обычный день"
-
-
-ВАЖНЫЕ ПРАВИЛА ДЛЯ quote:
-
-- Это должна быть новая мысль каждый раз.
-- Не используй одну и ту же фразу.
-- Не используй шаблон "даже самый длинный путь начинается..."
-- Можно лёгко шутить про Иркутск, утро, погоду и настроение.
-- Можно учитывать разговоры из чата.
-- Не использовать имена людей.
-- Не упоминать Telegram.
-- Не упоминать бота.
-- Не упоминать технологии.
-- Длина 1-3 предложения.
-
-
-Сделай мысль живой.
-Ответ только JSON.
+Дополнительные правила:
+- мысль должна быть живой и вызывать улыбку;
+- не использовать имена людей;
+- не упоминать Telegram, бота или технологии;
+- не копировать сообщения дословно.
 """
-
 
     try:
 
         async with gemini_lock:
 
             response = await gemini.aio.models.generate_content(
-
                 model="gemini-2.5-flash",
-
                 contents=prompt,
-
                 config=genai_types.GenerateContentConfig(
-
-                    temperature=1.0,
-
+                    temperature=0.8,
                     response_mime_type="application/json",
-
                     response_schema=DailyPostSchema
                 )
             )
 
 
+        # Универсальная и безопасная распаковка ответа
         if response.parsed:
-
-            if hasattr(
-                response.parsed,
-                "model_dump"
-            ):
-
+            if hasattr(response.parsed, "model_dump"):
                 return response.parsed.model_dump()
-
-
-            if isinstance(
-                response.parsed,
-                dict
-            ):
-
+            elif isinstance(response.parsed, dict):
                 return response.parsed
+            else:
+                return dict(response.parsed)
 
 
-
+        # Запасной вариант
         import json
-
-        return json.loads(
-            response.text
-        )
+        return json.loads(response.text)
 
 
     except Exception as e:
@@ -519,13 +481,12 @@ async def generate_text() -> dict:
 
 
         return {
+            "holiday": "День спокойных решений",
+            "quote": "Даже самый длинный путь начинается с маленького шага, а иногда — с перезапуска утром."
+        }
 
-            "holiday":
-            "Обычный день",
 
-            "quote":
-            "Каждое утро даёт новый шанс сделать что-то лучше, чем вчера."
-        }# =====================================================
+# =====================================================
 # POST CREATOR
 # =====================================================
 
@@ -597,7 +558,6 @@ def setup_scheduler():
 
 
     # Каждый день 09:00 Иркутск
-
     scheduler.add_job(
 
         create_daily_post,
@@ -626,7 +586,6 @@ def setup_scheduler():
 
     # Очистка базы раз в неделю
     # Воскресенье 04:00 Иркутск
-
     scheduler.add_job(
 
         clear_old_messages,
@@ -670,7 +629,9 @@ async def main():
     await init_db()
 
 
+
     setup_scheduler()
+
 
 
     logging.info(
@@ -700,9 +661,11 @@ async def main():
         )
 
 
+
         scheduler.shutdown(
             wait=False
         )
+
 
 
         if db_conn:
