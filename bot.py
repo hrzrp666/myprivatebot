@@ -117,6 +117,7 @@ async def init_db():
     )
 
 
+    # Включаем WAL-режим корректно
     await db_conn.execute(
         "PRAGMA journal_mode=WAL;"
     )
@@ -155,7 +156,7 @@ async def init_db():
 
 
     logging.info(
-        "SQLite готова"
+        "SQLite готова в режиме WAL"
     )
 
 
@@ -418,29 +419,28 @@ async def generate_text() -> dict:
 
     chat = await get_recent_messages()
 
+    current_date_str = datetime.now(TZ).strftime("%d.%m.%Y")
+
 
     prompt = f"""
 Ты — мудрый участник компании друзей из Иркутска.
 Каждое утро создавай короткую мысль дня на основе последних разговоров.
 
 Дата:
-{datetime.now(TZ).strftime("%d.%m.%Y")}
+{current_date_str}
 
 Последние разговоры:
 {chat}
 
-Правила:
-- мысль должна быть живой;
-- немного философской;
-- добавить лёгкую иронию;
-- должна вызывать улыбку;
-- учитывать настроение разговора;
+Правила для JSON полей (СТРОГО):
+- holiday: Напиши исключительно ОФИЦИАЛЬНЫЙ, общеизвестный реальный праздник или памятную дату, которая действительно выпадает на этот день ({current_date_str}) в мире или России. Категорически ЗАПРЕЩЕНО выдумывать шуточные или фейковые праздники на основе контекста разговоров (никаких дней гулей и т.д.).
+- quote: Мудрая короткая мысль (1-3 предложения) с лёгким юмором и иронией, которая тонко обыгрывает или учитывает настроение разговоров в чате. Вот здесь ты можешь шутить, подкалывать и иронизировать над темами из разговоров.
+
+Дополнительные правила:
+- мысль должна быть живой и вызывать улыбку;
 - не использовать имена людей;
-- не упоминать Telegram;
-- не упоминать бота;
-- не упоминать технологии;
-- не копировать сообщения;
-- длина цитаты 1-3 предложения.
+- не упоминать Telegram, бота или технологии;
+- не копировать сообщения дословно.
 """
 
     try:
@@ -451,14 +451,14 @@ async def generate_text() -> dict:
                 model="gemini-2.5-flash",
                 contents=prompt,
                 config=genai_types.GenerateContentConfig(
-                    temperature=0.9,
+                    temperature=0.8,
                     response_mime_type="application/json",
                     response_schema=DailyPostSchema
                 )
             )
 
 
-        # Универсальная и безопасная распаковка любого типа ответа SDK в dict
+        # Универсальная и безопасная распаковка ответа
         if response.parsed:
             if hasattr(response.parsed, "model_dump"):
                 return response.parsed.model_dump()
@@ -468,7 +468,7 @@ async def generate_text() -> dict:
                 return dict(response.parsed)
 
 
-        # Запасной вариант на случай сырого текста
+        # Запасной вариант
         import json
         return json.loads(response.text)
 
@@ -480,7 +480,6 @@ async def generate_text() -> dict:
         )
 
 
-        # Аварийная мудрость возвращает чистый dict
         return {
             "holiday": "День спокойных решений",
             "quote": "Даже самый длинный путь начинается с маленького шага, а иногда — с перезапуска утром."
@@ -512,7 +511,6 @@ async def create_daily_post(
 
         try:
 
-            # Тут гарантированно получаем чистый dict
             data = await generate_text()
 
 
