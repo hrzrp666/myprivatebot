@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import json
 import os
 
 from datetime import datetime, timedelta
@@ -11,6 +10,8 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
 from google import genai
 from google.genai import types as genai_types
 
@@ -19,9 +20,9 @@ from pydantic import BaseModel
 import aiosqlite
 
 
-# =====================
+# =====================================================
 # CONFIG
-# =====================
+# =====================================================
 
 load_dotenv()
 
@@ -32,29 +33,32 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 
 if not TELEGRAM_TOKEN:
-    raise Exception("Нет TELEGRAM_TOKEN")
+    raise RuntimeError("Нет TELEGRAM_TOKEN")
 
 if not GEMINI_KEY:
-    raise Exception("Нет GEMINI_API_KEY")
+    raise RuntimeError("Нет GEMINI_API_KEY")
 
 if not CHAT_ID:
-    raise Exception("Нет CHAT_ID")
+    raise RuntimeError("Нет CHAT_ID")
 
 
 CHAT_ID = int(CHAT_ID)
 
 
+# Иркутское время
 TZ = ZoneInfo("Asia/Irkutsk")
 
 
 logging.basicConfig(
-    level=logging.INFO
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
 
-# =====================
+
+# =====================================================
 # INIT
-# =====================
+# =====================================================
 
 bot = Bot(
     token=TELEGRAM_TOKEN
@@ -68,31 +72,39 @@ gemini = genai.Client(
 )
 
 
+scheduler = AsyncIOScheduler(
+    timezone=TZ
+)
+
+
 DB_PATH = "bot.db"
 
 
 db_conn = None
 
+
 db_lock = asyncio.Lock()
 
 post_lock = asyncio.Lock()
 
+gemini_lock = asyncio.Lock()
 
 
-# =====================
+
+# =====================================================
 # GEMINI SCHEMA
-# =====================
+# =====================================================
 
 class DailyPostSchema(BaseModel):
+
     holiday: str
     quote: str
 
 
 
-# =====================
+# =====================================================
 # DATABASE
-# =====================
-
+# =====================================================
 
 async def init_db():
 
@@ -133,7 +145,7 @@ async def init_db():
 
     await db_conn.execute(
         """
-        CREATE INDEX IF NOT EXISTS idx_created
+        CREATE INDEX IF NOT EXISTS idx_messages_created
         ON messages(created)
         """
     )
@@ -142,10 +154,15 @@ async def init_db():
     await db_conn.commit()
 
 
+    logging.info(
+        "SQLite готова"
+    )
+
+
 
 async def save_message(
-    username,
-    text
+    username: str,
+    text: str
 ):
 
     async with db_lock:
@@ -153,15 +170,20 @@ async def save_message(
         await db_conn.execute(
             """
             INSERT INTO messages
-            (username,text,created)
+            (
+                username,
+                text,
+                created
+            )
             VALUES(?,?,?)
             """,
             (
                 username,
-                text,
+                text[:1000],
                 datetime.now(TZ).isoformat()
             )
         )
+
 
         await db_conn.commit()
 
@@ -171,7 +193,8 @@ async def get_recent_messages():
 
     limit_time = (
         datetime.now(TZ)
-        - timedelta(days=1)
+        -
+        timedelta(hours=24)
     ).isoformat()
 
 
@@ -194,19 +217,51 @@ async def get_recent_messages():
 
     if not rows:
 
-        return (
-            "В чате было спокойно."
-        )
+        return "В чате было спокойно."
+
 
 
     rows.reverse()
 
 
-    return "\n".join(
+    result = "\n".join(
         [
             f"{user}: {text}"
             for user, text in rows
         ]
+    )
+
+
+    # защита лимита Gemini
+    return result[-8000:]
+
+
+
+async def clear_old_messages():
+
+    limit_time = (
+        datetime.now(TZ)
+        -
+        timedelta(days=30)
+    ).isoformat()
+
+
+    async with db_lock:
+
+        await db_conn.execute(
+            """
+            DELETE FROM messages
+            WHERE created < ?
+            """,
+            (limit_time,)
+        )
+
+
+        await db_conn.commit()
+
+
+    logging.info(
+        "Старая история очищена"
     )
 
 
@@ -253,14 +308,13 @@ async def save_post_today():
             (today,)
         )
 
+
         await db_conn.commit()
 
 
-
-# =====================
+# =====================================================
 # COMMANDS
-# =====================
-
+# =====================================================
 
 @dp.message(Command("start"))
 async def start(
@@ -269,7 +323,7 @@ async def start(
 
     await message.answer(
         "🧙 Мудрец Мяумура запущен.\n\n"
-        "Я анализирую чат и создаю мысль дня."
+        "Я слушаю разговоры и каждое утро создаю мысль дня."
     )
 
 
@@ -280,7 +334,7 @@ async def test(
 ):
 
     await message.answer(
-        "🧠 Создаю тестовую мудрость..."
+        "🧠 Создаю тестовую мысль..."
     )
 
 
@@ -290,130 +344,152 @@ async def test(
 
 
 
-# =====================
-# CHAT
-# =====================
+# =====================================================
+# CHAT COLLECTOR
+# =====================================================
 
-
-@dp.message(
-    lambda message:
-    message.text
-    and not message.text.startswith("/")
-)
-async def collect_messages(
+@dp.message()
+async def collect(
     message: types.Message
 ):
 
+    # только нужный чат
     if message.chat.id != CHAT_ID:
         return
 
 
-    if message.from_user and message.from_user.is_bot:
+    # только текст
+    if not message.text:
         return
 
 
+    # игнорируем команды
+    if message.text.startswith("/"):
+        return
+
+
+    # игнорируем ботов
+    if (
+        message.from_user
+        and message.from_user.is_bot
+    ):
+        return
+
+
+
     username = (
+
         message.from_user.first_name
+
         if message.from_user
+        and message.from_user.first_name
+
         else "Участник"
+
     )
 
 
-    await save_message(
-        username,
-        message.text
-    )
+    try:
+
+        await save_message(
+            username,
+            message.text
+        )
 
 
-    logging.info(
-        f"{username}: {message.text}"
-    )
+        logging.info(
+            f"{username}: {message.text}"
+        )
+
+
+    except Exception as e:
+
+        logging.error(
+            f"Ошибка сохранения сообщения: {e}"
+        )
 
 
 
-# =====================
+# =====================================================
 # GEMINI
-# =====================
+# =====================================================
 
-
-async def generate_text():
-
+async def generate_text() -> dict:
 
     chat = await get_recent_messages()
 
 
-    today = datetime.now(TZ)
-
-
     prompt = f"""
+Ты — мудрый участник компании друзей из Иркутска.
+Каждое утро создавай короткую мысль дня на основе последних разговоров.
 
-Ты — мудрый, но слегка ироничный участник компании друзей.
+Дата:
+{datetime.now(TZ).strftime("%d.%m.%Y")}
 
-Каждое утро создавай мысль дня
-на основе последних разговоров.
-
-
-Сегодня:
-{today.strftime("%d.%m.%Y")}
-
-
-Разговоры:
-
+Последние разговоры:
 {chat}
 
-
-Верни JSON:
-
-{{
-"holiday":"реальный праздник сегодня",
-"quote":"философская цитата с юмором"
-}}
-
-
 Правила:
-
-- Цитата мудрая, но живая.
-- Добавь лёгкую иронию.
-- Пусть будет немного смешно.
-- Используй настроение разговора.
-- Не упоминай имена людей.
-- Не упоминай Telegram, бота и технологии.
-- Не копируй сообщения.
-- Избегай банальных фраз.
-- Длина 1-3 предложения.
-
-
-Ответ только JSON.
+- мысль должна быть живой;
+- немного философской;
+- добавить лёгкую иронию;
+- должна вызывать улыбку;
+- учитывать настроение разговора;
+- не использовать имена людей;
+- не упоминать Telegram;
+- не упоминать бота;
+- не упоминать технологии;
+- не копировать сообщения;
+- длина цитаты 1-3 предложения.
 """
 
+    try:
 
-    response = await gemini.aio.models.generate_content(
+        async with gemini_lock:
 
-        model="gemini-2.5-flash",
+            response = await gemini.aio.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
+                    temperature=0.9,
+                    response_mime_type="application/json",
+                    response_schema=DailyPostSchema
+                )
+            )
 
-        contents=prompt,
 
-        config=genai_types.GenerateContentConfig(
+        # Универсальная и безопасная распаковка любого типа ответа SDK в dict
+        if response.parsed:
+            if hasattr(response.parsed, "model_dump"):
+                return response.parsed.model_dump()
+            elif isinstance(response.parsed, dict):
+                return response.parsed
+            else:
+                return dict(response.parsed)
 
-            temperature=0.9,
 
-            response_mime_type="application/json",
+        # Запасной вариант на случай сырого текста
+        import json
+        return json.loads(response.text)
 
-            response_schema=DailyPostSchema
+
+    except Exception as e:
+
+        logging.error(
+            f"Gemini ошибка: {e}"
         )
-    )
 
 
-    return json.loads(
-        response.text
-    )
+        # Аварийная мудрость возвращает чистый dict
+        return {
+            "holiday": "День спокойных решений",
+            "quote": "Даже самый длинный путь начинается с маленького шага, а иногда — с перезапуска утром."
+        }
 
 
-
-# =====================
-# POST
-# =====================
-
+# =====================================================
+# POST CREATOR
+# =====================================================
 
 async def create_daily_post(
     force=False
@@ -421,22 +497,32 @@ async def create_daily_post(
 
     async with post_lock:
 
+
         if not force:
 
             if await was_post_today():
+
+                logging.info(
+                    "Пост уже отправлялся сегодня"
+                )
+
                 return
+
 
 
         try:
 
+            # Тут гарантированно получаем чистый dict
             data = await generate_text()
 
 
             text = (
+
                 f"📅 Сегодня:\n"
                 f"{data['holiday']}\n\n"
                 f"✨ Мысль дня:\n"
                 f"«{data['quote']}»"
+
             )
 
 
@@ -446,56 +532,108 @@ async def create_daily_post(
             )
 
 
-            await save_post_today()
+            if not force:
+
+                await save_post_today()
+
 
 
             logging.info(
-                "Пост отправлен"
+                "Мысль дня отправлена"
             )
+
 
 
         except Exception as e:
 
-            logging.error(
-                f"Ошибка поста: {e}"
+            logging.exception(
+                f"Ошибка создания поста: {e}"
             )
 
 
 
-# =====================
-# DAILY CHECK
-# =====================
+# =====================================================
+# SCHEDULER
+# =====================================================
+
+def setup_scheduler():
 
 
-async def daily_checker():
+    # Каждый день 09:00 Иркутск
+    scheduler.add_job(
 
-    while True:
+        create_daily_post,
 
-        now = datetime.now(TZ)
+        "cron",
+
+        hour=9,
+
+        minute=0,
+
+        kwargs={
+            "force": False
+        },
+
+        id="daily_post",
+
+        replace_existing=True,
+
+        misfire_grace_time=3600,
+
+        coalesce=True
+
+    )
 
 
-        if now.hour >= 9:
 
-            await create_daily_post()
+    # Очистка базы раз в неделю
+    # Воскресенье 04:00 Иркутск
+    scheduler.add_job(
+
+        clear_old_messages,
+
+        "cron",
+
+        day_of_week="sun",
+
+        hour=4,
+
+        minute=0,
+
+        id="database_cleanup",
+
+        replace_existing=True,
+
+        misfire_grace_time=3600,
+
+        coalesce=True
+
+    )
 
 
-        await asyncio.sleep(60)
+
+    scheduler.start()
+
+
+    logging.info(
+        "Планировщик запущен: Иркутск 09:00"
+    )
 
 
 
-# =====================
-# START
-# =====================
-
+# =====================================================
+# MAIN
+# =====================================================
 
 async def main():
+
 
     await init_db()
 
 
-    asyncio.create_task(
-        daily_checker()
-    )
+
+    setup_scheduler()
+
 
 
     logging.info(
@@ -503,19 +641,48 @@ async def main():
     )
 
 
+
     try:
 
+
         await dp.start_polling(
-            bot
+
+            bot,
+
+            skip_updates=True
+
         )
 
+
+
     finally:
+
+
+        logging.info(
+            "Остановка бота..."
+        )
+
+
+
+        scheduler.shutdown(
+            wait=False
+        )
+
+
 
         if db_conn:
 
             await db_conn.close()
 
 
+
+        await bot.session.close()
+
+
+
+# =====================================================
+# ENTRY POINT
+# =====================================================
 
 if __name__ == "__main__":
 
