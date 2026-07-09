@@ -1,3 +1,4 @@
+from aiohttp import web # Добавьте эту строку к остальным импортам
 import asyncio
 import logging
 import os
@@ -622,21 +623,25 @@ def setup_scheduler():
 # =====================================================
 # MAIN
 # =====================================================
-
+async def start_web_server():
+    app = web.Application()
+    # Порт берется из настроек Render (переменная окружения PORT)
+    port = int(os.getenv("PORT", 8080))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logging.info(f"Веб-сервер запущен на порту {port}")
+    
 async def main():
-
-
     await init_db()
-
-
-
     setup_scheduler()
-
-
-
-    logging.info(
-        "🧙 Мудрец Мяумура работает"
-    )
+    
+    # ВОТ ЭТА СТРОЧКА ЗАПУСКАЕТ ВЕБ-СЕРВЕР ДЛЯ RENDER
+    await start_web_server() 
+    
+    logging.info("🧙 Мудрец Мяумура работает")
+    # ... дальше ваш код dp.start_polling ...
 
 
 
