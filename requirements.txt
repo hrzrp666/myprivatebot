@@ -1,6 +1,6 @@
-aiogram==3.18.0
-apscheduler==3.11.0
-google-genai==0.1.1
-pydantic==2.10.6
-aiosqlite==0.20.0
-python-dotenv==1.0.1
+aiogram
+apscheduler
+google-genai
+pydantic
+aiosqlite
+python-dotenv
