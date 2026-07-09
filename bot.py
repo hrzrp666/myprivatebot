@@ -448,7 +448,7 @@ async def generate_text() -> dict:
         async with gemini_lock:
 
             response = await gemini.aio.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-2.0-flash",
                 contents=prompt,
                 config=genai_types.GenerateContentConfig(
                     temperature=0.8,
