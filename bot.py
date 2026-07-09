@@ -11,8 +11,6 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
 from google import genai
 from google.genai import types as genai_types
 
@@ -70,12 +68,8 @@ gemini = genai.Client(
 )
 
 
-scheduler = AsyncIOScheduler(
-    timezone=TZ
-)
-
-
 DB_PATH = "bot.db"
+
 
 db_conn = None
 
@@ -130,6 +124,15 @@ async def init_db():
 
     await db_conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS posts(
+            date TEXT PRIMARY KEY
+        )
+        """
+    )
+
+
+    await db_conn.execute(
+        """
         CREATE INDEX IF NOT EXISTS idx_created
         ON messages(created)
         """
@@ -137,11 +140,6 @@ async def init_db():
 
 
     await db_conn.commit()
-
-
-    logging.info(
-        "База данных готова"
-    )
 
 
 
@@ -155,8 +153,8 @@ async def save_message(
         await db_conn.execute(
             """
             INSERT INTO messages
-            (username, text, created)
-            VALUES (?, ?, ?)
+            (username,text,created)
+            VALUES(?,?,?)
             """,
             (
                 username,
@@ -164,7 +162,6 @@ async def save_message(
                 datetime.now(TZ).isoformat()
             )
         )
-
 
         await db_conn.commit()
 
@@ -182,16 +179,13 @@ async def get_recent_messages():
 
         async with db_conn.execute(
             """
-            SELECT username, text
+            SELECT username,text
             FROM messages
             WHERE created >= ?
             ORDER BY id DESC
             LIMIT 300
             """,
-            (
-                limit_time,
-            )
-
+            (limit_time,)
         ) as cursor:
 
             rows = await cursor.fetchall()
@@ -201,8 +195,7 @@ async def get_recent_messages():
     if not rows:
 
         return (
-            "В чате было спокойно. "
-            "Интересных тем почти не было."
+            "В чате было спокойно."
         )
 
 
@@ -218,6 +211,52 @@ async def get_recent_messages():
 
 
 
+async def was_post_today():
+
+    today = datetime.now(TZ).strftime(
+        "%Y-%m-%d"
+    )
+
+
+    async with db_lock:
+
+        async with db_conn.execute(
+            """
+            SELECT date
+            FROM posts
+            WHERE date=?
+            """,
+            (today,)
+        ) as cursor:
+
+            result = await cursor.fetchone()
+
+
+    return result is not None
+
+
+
+async def save_post_today():
+
+    today = datetime.now(TZ).strftime(
+        "%Y-%m-%d"
+    )
+
+
+    async with db_lock:
+
+        await db_conn.execute(
+            """
+            INSERT OR IGNORE INTO posts(date)
+            VALUES(?)
+            """,
+            (today,)
+        )
+
+        await db_conn.commit()
+
+
+
 # =====================
 # COMMANDS
 # =====================
@@ -229,9 +268,8 @@ async def start(
 ):
 
     await message.answer(
-        "🧙 Мудрец Мяумура работает.\n\n"
-        "Я читаю чат и каждое утро "
-        "создаю мысль дня."
+        "🧙 Мудрец Мяумура запущен.\n\n"
+        "Я анализирую чат и создаю мысль дня."
     )
 
 
@@ -246,7 +284,9 @@ async def test(
     )
 
 
-    await create_daily_post()
+    await create_daily_post(
+        force=True
+    )
 
 
 
@@ -279,14 +319,14 @@ async def collect_messages(
     )
 
 
-    logging.info(
-        f"{username}: {message.text}"
-    )
-
-
     await save_message(
         username,
         message.text
+    )
+
+
+    logging.info(
+        f"{username}: {message.text}"
     )
 
 
@@ -309,20 +349,20 @@ async def generate_text():
 
 Ты — мудрый, но слегка ироничный участник компании друзей.
 
-Каждое утро ты создаёшь "мысль дня"
-по мотивам последних разговоров в чате.
+Каждое утро создавай мысль дня
+на основе последних разговоров.
 
 
 Сегодня:
 {today.strftime("%d.%m.%Y")}
 
 
-Последние сообщения:
+Разговоры:
 
 {chat}
 
 
-Верни только JSON:
+Верни JSON:
 
 {{
 "holiday":"реальный праздник сегодня",
@@ -330,18 +370,17 @@ async def generate_text():
 }}
 
 
-Правила цитаты:
+Правила:
 
-- Она должна быть мудрой, но живой.
+- Цитата мудрая, но живая.
 - Добавь лёгкую иронию.
-- Она должна вызывать улыбку.
-- Используй настроение или тему разговора.
+- Пусть будет немного смешно.
+- Используй настроение разговора.
 - Не упоминай имена людей.
 - Не упоминай Telegram, бота и технологии.
 - Не копируй сообщения.
-- Избегай общих фраз вроде "люди всегда стремятся".
-- Цитата должна выглядеть как мысль человека из вашей компании.
-- Длина: 1-3 предложения.
+- Избегай банальных фраз.
+- Длина 1-3 предложения.
 
 
 Ответ только JSON.
@@ -376,9 +415,17 @@ async def generate_text():
 # =====================
 
 
-async def create_daily_post():
+async def create_daily_post(
+    force=False
+):
 
     async with post_lock:
+
+        if not force:
+
+            if await was_post_today():
+                return
+
 
         try:
 
@@ -399,6 +446,9 @@ async def create_daily_post():
             )
 
 
+            await save_post_today()
+
+
             logging.info(
                 "Пост отправлен"
             )
@@ -413,6 +463,27 @@ async def create_daily_post():
 
 
 # =====================
+# DAILY CHECK
+# =====================
+
+
+async def daily_checker():
+
+    while True:
+
+        now = datetime.now(TZ)
+
+
+        if now.hour >= 9:
+
+            await create_daily_post()
+
+
+        await asyncio.sleep(60)
+
+
+
+# =====================
 # START
 # =====================
 
@@ -422,19 +493,13 @@ async def main():
     await init_db()
 
 
-    scheduler.add_job(
-        create_daily_post,
-        "cron",
-        hour=9,
-        minute=0
+    asyncio.create_task(
+        daily_checker()
     )
 
 
-    scheduler.start()
-
-
     logging.info(
-        "🧙 Мудрец Мяумура запущен"
+        "🧙 Мудрец Мяумура работает"
     )
 
 
@@ -444,11 +509,7 @@ async def main():
             bot
         )
 
-
     finally:
-
-        scheduler.shutdown()
-
 
         if db_conn:
 
