@@ -10,7 +10,6 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.executors.asyncio import AsyncIOExecutor
 
 from google import genai
 from google.genai import types as genai_types
@@ -27,7 +26,7 @@ GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 CHAT_ID = os.getenv("CHAT_ID")
 
 if not TELEGRAM_TOKEN or not GEMINI_KEY or not CHAT_ID:
-    raise RuntimeError("Проверьте переменные окружения в .env")
+    raise RuntimeError("Проверьте переменные очередей в .env")
 
 CHAT_ID = int(CHAT_ID)
 TZ = ZoneInfo("Asia/Irkutsk")
@@ -44,11 +43,8 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 gemini = genai.Client(api_key=GEMINI_KEY)
 
-# Executor привязывает планировщик к основному циклу событий aiogram
-scheduler = AsyncIOScheduler(
-    timezone=TZ,
-    executors={"default": AsyncIOExecutor()}
-)
+# Чистый планировщик без конфликтующих пулов потоков
+scheduler = AsyncIOScheduler(timezone=TZ)
 
 DB_PATH = "bot.db"
 
@@ -67,7 +63,6 @@ class DailyPostSchema(BaseModel):
 # DATABASE
 # =====================================================
 async def connect_db():
-    """Открывает изолированное соединение и форсирует режим WAL."""
     db = await aiosqlite.connect(DB_PATH)
     await db.execute("PRAGMA journal_mode=WAL;")
     return db
@@ -150,7 +145,7 @@ async def save_post_today():
 @dp.message(Command("start"))
 async def start(message: types.Message):
     await message.answer(
-        "🧙 Мудрец Мяумура запущен.\n\nЯ слушаю разговоры и каждое утро создаю мысль дня."
+        "🧙 Мудрец Мяумура запущен.\n\nЯ слушаю разговоры в группе и каждое утро создаю мысль дня."
     )
 
 @dp.message(Command("test"))
@@ -160,6 +155,11 @@ async def test(message: types.Message):
 
 @dp.message()
 async def collect(message: types.Message):
+    # Если написали в ЛС бота — просто игнорируем сборщик текста, но не вешаем бота
+    if message.chat.type == "private":
+        return
+        
+    # Сюда попадают только сообщения из целевой группы
     if message.chat.id != CHAT_ID or not message.text or message.text.startswith("/"):
         return
     if message.from_user and message.from_user.is_bot:
@@ -249,7 +249,7 @@ async def create_daily_post(force=False):
             logging.exception(f"Ошибка создания поста: {e}")
 
 # =====================================================
-# SCHEDULER & MAIN
+# SCHEDULER SETUP
 # =====================================================
 def setup_scheduler():
     scheduler.add_job(
@@ -277,8 +277,12 @@ def setup_scheduler():
     scheduler.start()
     logging.info("Планировщик запущен: Иркутск 09:00")
 
+# =====================================================
+# MAIN
+# =====================================================
 async def main():
     await init_db()
+    # Запускаем планировщик строго внутри асинхронного цикла событий main
     setup_scheduler()
     logging.info("🧙 Мудрец Мяумура запущен и готов к работе")
 
