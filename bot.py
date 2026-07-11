@@ -1,4 +1,4 @@
-from aiohttp import web # Добавьте эту строку к остальным импортам
+from aiohttp import web 
 import asyncio
 import logging
 import os
@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
+from aiogram.utils.markdown import hlink 
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -62,7 +63,8 @@ logging.basicConfig(
 # =====================================================
 
 bot = Bot(
-    token=TELEGRAM_TOKEN
+    token=TELEGRAM_TOKEN,
+    default_properties={"parse_mode": "HTML"}
 )
 
 dp = Dispatcher()
@@ -145,10 +147,39 @@ async def init_db():
     )
 
 
+    # ДОБАВЛЕНО: Таблица для ставок и споров чата
+    await db_conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bets(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            message_id INTEGER,
+            user_id INTEGER,
+            user_name TEXT,
+            target_user_id INTEGER,
+            target_user_name TEXT,
+            team TEXT,
+            stake TEXT,
+            status TEXT DEFAULT 'active',
+            created TEXT
+        )
+        """
+    )
+
+
     await db_conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_messages_created
         ON messages(created)
+        """
+    )
+
+
+    # ДОБАВЛЕНО: Индекс для быстрого поиска активных споров
+    await db_conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_bets_status 
+        ON bets(status)
         """
     )
 
@@ -344,6 +375,129 @@ async def test(
         force=True
     )
 
+
+# ДОБАВЛЕНО: Команда спортивной аналитики ИИ
+@dp.message(Command("predict"))
+async def cmd_predict(message: types.Message):
+    match_info = message.text.replace("/predict", "").strip()
+    if not match_info:
+        await message.answer("🔮 Укажите участников матча. Пример: <code>/predict Норвегия - Англия</code>")
+        return
+
+    waiting_msg = await message.answer("🔮 Мудрец Мяумура вглядывается в линии вероятностей...")
+    prompt = f"Ты — спортивный аналитик и мудрый кот Мяумура. Сделай ироничный разбор матча: {match_info}. Назови фаворита и дай кошачий совет."
+
+    try:
+        async with gemini_lock:
+            response = await gemini.aio.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        await waiting_msg.edit_text(response.text)
+    except Exception as e:
+        logging.error(f"Ошибка Gemini: {e}")
+        await waiting_msg.edit_text("🔮 Звезды спорта скрылись за тучами. Попробуйте позже.")
+
+
+# ДОБАВЛЕНО: Команда фиксации нового спора между игроками
+@dp.message(Command("bet"))
+async def cmd_bet(message: types.Message):
+    if message.chat.id != CHAT_ID:
+        return
+
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.answer("⚠️ Ответьте командой <code>/bet</code> на сообщение человека, с которым вы спорите.")
+        return
+
+    args = message.text.replace("/bet", "").strip().split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("⚠️ Формат: <code>/bet &lt;команда&gt; &lt;ставка&gt;</code>\nПример: <code>/bet Норвегия на пиццу</code>")
+        return
+
+    team, stake = args[0], args[1]
+    user_id = message.from_user.id
+    user_name = message.from_user.first_name or "Участник"
+    target_user_id = message.reply_to_message.from_user.id
+    target_user_name = message.reply_to_message.from_user.first_name or "Оппонент"
+
+    if user_id == target_user_id:
+        await message.answer("😸 Нельзя спорить с самим собой.")
+        return
+
+    bot_msg = await message.answer("📝 Записываю условия спора...")
+
+    async with db_lock:
+        await db_conn.execute(
+            """
+            INSERT INTO bets (chat_id, message_id, user_id, user_name, target_user_id, target_user_name, team, stake, created)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (CHAT_ID, bot_msg.message_id, user_id, user_name, target_user_id, target_user_name, team, stake, datetime.now(TZ).isoformat())
+        )
+        await db_conn.commit()
+
+    user_link = hlink(user_name, f"tg://user?id={user_id}")
+    target_link = hlink(target_user_name, f"tg://user?id={target_user_id}")
+
+    await bot_msg.edit_text(
+        f"🤝 <b>Спор принят и записан в лапы!</b>\n\n"
+        f"👤 {user_link} ставит на: <b>{team}</b>\n"
+        f"🎯 Оппонент: {target_link}\n"
+        f"💳 На кону: <b>{stake}</b>\n\n"
+        f"Чтобы рассчитать этот спор, ответьте на ЭТО сообщение командой:\n"
+        f"<code>/match_result 1</code> — если выиграл {user_name}\n"
+        f"<code>/match_result 2</code> — если выиграл {target_user_name}"
+    )
+
+
+# ДОБАВЛЕНО: Команда подведения итогов спора по message_id
+@dp.message(Command("match_result"))
+async def cmd_match_result(message: types.Message):
+    if message.chat.id != CHAT_ID:
+        return
+
+    if not message.reply_to_message:
+        await message.answer("⚠️ Ответьте командой <code>/match_result 1</code> или <code>/match_result 2</code> на сообщение бота, в котором он зафиксировал ваш спор.")
+        return
+
+    choice = message.text.replace("/match_result", "").strip()
+    if choice not in ["1", "2"]:
+        await message.answer("⚠️ Укажите победителя цифрой 1 или 2.")
+        return
+
+    reply_msg_id = message.reply_to_message.message_id
+
+    async with db_lock:
+        async with db_conn.execute(
+            "SELECT id, user_name, target_user_name, team, stake, user_id, target_user_id FROM bets WHERE chat_id = ? AND message_id = ? AND status = 'active'",
+            (CHAT_ID, reply_msg_id)
+        ) as cursor:
+            bet = await cursor.fetchone()
+
+        if not bet:
+            await message.answer("🐾 В моих архивах не найдено активного спора, связанного с этим сообщением.")
+            return
+
+        bet_id, u_name, t_name, team, stake, u_id, t_id = bet
+        await db_conn.execute("UPDATE bets SET status = 'completed' WHERE id = ?", (bet_id,))
+        await db_conn.commit()
+
+    u_link = hlink(u_name, f"tg://user?id={u_id}")
+    t_link = hlink(t_name, f"tg://user?id={t_id}")
+
+    if choice == "1":
+        debt_text = f"🏆 <b>{u_link}</b> оказался прав в своей ставке на <b>{team}</b>!\n💸 Проигравший {t_link} теперь обязан отдать: <b>{stake}</b>"
+        winner = u_name
+    else:
+        debt_text = f"🏆 <b>{t_link}</b> побеждает в споре!\n💸 Проигравший {u_link} (ставивший на {team}) теперь обязан отдать: <b>{stake}</b>"
+        winner = t_name
+
+    prompt = f"Напиши короткую кошачью шутку-наставление от Мудреца Мяумура про то, что человек по имени {winner} победил в споре, а проигравший должен поскорее вернуть долг."
+    try:
+        async with gemini_lock:
+            response = await gemini.aio.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        bot_comment = response.text
+    except Exception:
+        bot_comment = "🐾 Судьба определила сильнейшего. Время платить по счетам!"
+
+    await message.answer(f"{debt_text}\n\n🔮 <b>Слово Мяумуры:</b>\n{bot_comment}")
 
 
 # =====================================================
@@ -623,8 +777,10 @@ def setup_scheduler():
 # =====================================================
 # MAIN
 # =====================================================
+
 async def handle(request):
     return web.Response(text="Bot is running", status=200)
+
 
 async def start_web_server():
     app = web.Application()
@@ -636,17 +792,20 @@ async def start_web_server():
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     logging.info(f"Веб-сервер успешно запущен на порту {port}")
-    
-async def main():
-    await init_db()
-    setup_scheduler()
-    
-    # ВОТ ЭТА СТРОЧКА ЗАПУСКАЕТ ВЕБ-СЕРВЕР ДЛЯ RENDER
-    await start_web_server() 
-    
-    logging.info("🧙 Мудрец Мяумура работает")
-    # ... дальше ваш код dp.start_polling ...
 
+
+async def main():
+
+    await init_db()
+
+    setup_scheduler()
+
+    await start_web_server()
+
+
+    logging.info(
+        "🧙 Мудрец Мяумура работает"
+    )
 
 
     try:
