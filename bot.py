@@ -624,28 +624,18 @@ def setup_scheduler():
 # MAIN
 # =====================================================
 async def handle(request):
-    return web.Response(text="Bot is running") # Бот будет отвечать этим текстом
+    return web.Response(text="Bot is running", status=200)
 
 async def start_web_server():
     app = web.Application()
-    # Вот эта строка отвечает за то, чтобы страница '/' существовала:
-    app.router.add_get('/', handle) 
+    app.router.add_get('/', handle)
     
     port = int(os.getenv("PORT", 8080))
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    
-async def start_web_server():
-    app = web.Application()
-    # Порт берется из настроек Render (переменная окружения PORT)
-    port = int(os.getenv("PORT", 8080))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    logging.info(f"Веб-сервер запущен на порту {port}")
+    logging.info(f"Веб-сервер успешно запущен на порту {port}")
     
 async def main():
     await init_db()
