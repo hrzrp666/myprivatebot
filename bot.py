@@ -389,7 +389,7 @@ async def cmd_predict(message: types.Message):
 
     try:
         async with gemini_lock:
-            response = await gemini.aio.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+            response = await gemini.aio.models.generate_content(model="gemini-3-flash-preview", contents=prompt)
         await waiting_msg.edit_text(response.text)
     except Exception as e:
         logging.error(f"Ошибка Gemini: {e}")
