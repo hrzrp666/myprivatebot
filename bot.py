@@ -388,7 +388,7 @@ async def test(
 async def cmd_predict(message: types.Message):
     match_info = message.text.replace("/predict", "").strip()
     if not match_info:
-        await message.answer("🔮 Укажите участников матча. Пример: <code>/predict Норвегия - Англия</code>")
+        await message.answer("🔮 Укажите участников матча. Пример: <code>/predict Норвегия - Англия</code>", parse_mode="HTML")
         return
 
     waiting_msg = await message.answer("🔮 Мудрец Мяумура вглядывается в линии вероятностей...")
@@ -410,12 +410,12 @@ async def cmd_bet(message: types.Message):
         return
 
     if not message.reply_to_message or not message.reply_to_message.from_user:
-        await message.answer("⚠️ Ответьте командой <code>/bet</code> на сообщение человека, с которым вы спорите.")
+        await message.answer("⚠️ Ответьте командой <code>/bet</code> на сообщение человека, с которым вы спорите.", parse_mode="HTML")
         return
 
     args = message.text.replace("/bet", "").strip().split(maxsplit=1)
     if len(args) < 2:
-        await message.answer("⚠️ Формат: <code>/bet &lt;команда&gt; &lt;ставка&gt;</code>\nПример: <code>/bet Норвегия на пиццу</code>")
+        await message.answer("⚠️ Формат: <code>/bet &lt;команда&gt; &lt;ставка&gt;</code>\nПример: <code>/bet Норвегия на пиццу</code>", parse_mode="HTML")
         return
 
     team, stake = html.escape(args[0]), html.escape(args[1])
@@ -440,14 +440,13 @@ async def cmd_bet(message: types.Message):
         )
         await db_conn.commit()
 
-    # ИСПРАВЛЕНО: hlink сам экранирует имя внутри себя, поэтому убрано предварительное html.escape для имен.
-    # Для отображения внутри блоков <code> имена экранируются отдельно.
     user_link = hlink(user_name, f"tg://user?id={user_id}")
     target_link = hlink(target_user_name, f"tg://user?id={target_user_id}")
 
     safe_u_name_code = html.escape(user_name)
     safe_t_name_code = html.escape(target_user_name)
 
+    # ИСПРАВЛЕНО: Добавлен parse_mode="HTML" для метода edit_text, чтобы ссылки и теги <b> отображались корректно
     await bot_msg.edit_text(
         f"🤝 <b>Спор принят и записан в лапы!</b>\n\n"
         f"👤 {user_link} ставит на: <b>{team}</b>\n"
@@ -455,7 +454,8 @@ async def cmd_bet(message: types.Message):
         f"💳 На кону: <b>{stake}</b>\n\n"
         f"Чтобы рассчитать этот спор, ответьте на ЭТО сообщение командой:\n"
         f"<code>/match_result 1</code> — если выиграл {safe_u_name_code}\n"
-        f"<code>/match_result 2</code> — если выиграл {safe_t_name_code}"
+        f"<code>/match_result 2</code> — если выиграл {safe_t_name_code}",
+        parse_mode="HTML"
     )
 
 
@@ -466,7 +466,8 @@ async def cmd_match_result(message: types.Message):
         return
 
     if not message.reply_to_message:
-        await message.answer("⚠️ Ответьте командой <code>/match_result 1</code> или <code>/match_result 2</code> на сообщение бота, в котором он зафиксировал ваш спор.")
+        # ИСПРАВЛЕНО: Добавлен parse_mode="HTML", чтобы теги <code> не выводились текстом в предупреждении
+        await message.answer("⚠️ Ответьте командой <code>/match_result 1</code> или <code>/match_result 2</code> на сообщение бота, в котором он зафиксировал ваш спор.", parse_mode="HTML")
         return
 
     choice = message.text.replace("/match_result", "").strip()
@@ -491,7 +492,6 @@ async def cmd_match_result(message: types.Message):
         await db_conn.execute("UPDATE bets SET status = 'completed' WHERE id = ?", (bet_id,))
         await db_conn.commit()
 
-    # ИСПРАВЛЕНО: hlink сам безопасно экранирует текст ссылки, убрано двойное экранирование.
     u_link = hlink(u_name, f"tg://user?id={u_id}")
     t_link = hlink(t_name, f"tg://user?id={t_id}")
 
@@ -511,7 +511,8 @@ async def cmd_match_result(message: types.Message):
         logging.error(f"Ошибка Gemini в match_result: {e}")
         bot_comment = "🐾 Судьба определила сильнейшего. Время платить по счетам!"
 
-    await message.answer(f"{debt_text}\n\n🔮 <b>Слово Мяумура:</b>\n{bot_comment}")
+    # ИСПРАВЛЕНО: Добавлен parse_mode="HTML" для вывода результатов спора и шутки ИИ
+    await message.answer(f"{debt_text}\n\n🔮 <b>Слово Мяумура:</b>\n{bot_comment}", parse_mode="HTML")
 
 
 # =====================================================
