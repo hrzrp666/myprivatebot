@@ -561,11 +561,11 @@ async def collect(
 
 
     try:
-        clean_text = html.escape(message.text)
-
+        # ИСПРАВЛЕНИЕ: сохраняем сырой текст в БД, не экранируя заранее. 
+        # Экранирование применяется только перед отправкой в Telegram
         await save_message(
             username,
-            clean_text
+            message.text
         )
 
 
@@ -626,15 +626,9 @@ async def generate_text() -> dict:
                 )
             )
 
+        # ИСПРАВЛЕНИЕ: SDK Google GenAI при использовании response_schema 
+        # возвращает чистую JSON строку, поэтому обрезать бэктики не нужно.
         raw_text = response.text.strip()
-        if raw_text.startswith("```"):
-            if raw_text.startswith("```json"):
-                raw_text = raw_text[7:]
-            else:
-                raw_text = raw_text[3:]
-            if raw_text.endswith("```"):
-                raw_text = raw_text[:-3]
-        raw_text = raw_text.strip()
 
         return json.loads(raw_text)
 
@@ -844,9 +838,10 @@ async def main():
         )
 
 
-
+        # ИСПРАВЛЕНИЕ: Ждем корректного завершения всех задач планировщика,
+        # прежде чем закрыть соединение с базой данных
         scheduler.shutdown(
-            wait=False
+            wait=True
         )
 
 
