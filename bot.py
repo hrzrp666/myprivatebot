@@ -72,8 +72,8 @@ bot = Bot(
 dp = Dispatcher()
 
 
-# Используем асинхронный клиент для неблокирующих вызовов
-gemini = genai.aio.Client(
+# Инициализация клиента Google GenAI
+gemini = genai.Client(
     api_key=GEMINI_KEY
 )
 
