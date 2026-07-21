@@ -4,6 +4,7 @@ import logging
 import os
 import json
 import html
+import random
 
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -94,6 +95,10 @@ db_lock = asyncio.Lock()
 post_lock = asyncio.Lock()
 
 gemini_lock = asyncio.Lock()
+
+
+# Время последнего случайного комментария (чтобы не спамить)
+last_random_comment_time = datetime.min.replace(tzinfo=TZ)
 
 
 # Глобальная переменная для корректной остановки веб-сервера
@@ -199,12 +204,12 @@ async def save_message(
 
 
 
-async def get_recent_messages():
+async def get_recent_messages(hours=24, limit=300):
 
     limit_time = (
         datetime.now(TZ)
         -
-        timedelta(hours=24)
+        timedelta(hours=hours)
     ).isoformat()
 
 
@@ -216,9 +221,9 @@ async def get_recent_messages():
             FROM messages
             WHERE created >= ?
             ORDER BY id DESC
-            LIMIT 300
+            LIMIT ?
             """,
-            (limit_time,)
+            (limit_time, limit)
         ) as cursor:
 
             rows = await cursor.fetchall()
@@ -333,7 +338,11 @@ async def start(
 
     await message.answer(
         "🧙 Мудрец Мяумура запущен.\n\n"
-        "Я подслушаю разговоры и каждое утро создам мысль дня."
+        "📜 <b>Мои возможности:</b>\n"
+        "• Каждое утро в 09:00 — Мысль дня\n"
+        "• /question &lt;вопрос&gt; — Спросить мудреца\n"
+        "• /summary — Краткая выжимка (что пропустили в чате)\n"
+        "• Каждое воскресенье в 20:00 — Итоги недели"
     )
 
 
@@ -353,14 +362,58 @@ async def test(
     )
 
 
+@dp.message(Command("question"))
+async def question_cmd(
+    message: types.Message
+):
+
+    args = message.text.split(maxsplit=1)
+    
+    question_text = ""
+    if len(args) > 1:
+        question_text = args[1].strip()
+    elif message.reply_to_message and message.reply_to_message.text:
+        question_text = message.reply_to_message.text.strip()
+
+    if not question_text:
+        await message.reply(
+            "🧙 Чтобы получить мудрость, задай вопрос после команды, например:\n"
+            "<code>/question В чём смысл жизни?</code>"
+        )
+        return
+
+    answer = await ask_wisdom(question_text)
+    
+    safe_answer = html.escape(answer)
+    await message.reply(
+        f"🧙 <b>Мудрец Мяумура молвит:</b>\n\n{safe_answer}"
+    )
+
+
+@dp.message(Command("summary"))
+async def summary_cmd(
+    message: types.Message
+):
+    """Идея 3: Краткая выжимка того, что произошло в чате за 12 часов."""
+    status_msg = await message.reply("🔮 Вспоминаю, о чём вы шептались...")
+
+    summary_text = await generate_summary()
+    safe_summary = html.escape(summary_text)
+
+    await status_msg.edit_text(
+        f"📜 <b>Краткая выжимка разговоров:</b>\n\n{safe_summary}"
+    )
+
+
 # =====================================================
-# CHAT COLLECTOR
+# CHAT COLLECTOR & RANDOM INTERACTIVE
 # =====================================================
 
 @dp.message()
 async def collect(
     message: types.Message
 ):
+    global last_random_comment_time
 
     # только нужный чат
     if message.chat.id != CHAT_ID:
@@ -399,8 +452,6 @@ async def collect(
 
 
     try:
-        # ИСПРАВЛЕНИЕ: сохраняем сырой текст в БД, не экранируя заранее. 
-        # Экранирование применяется только перед отправкой в Telegram
         await save_message(
             username,
             message.text
@@ -411,6 +462,15 @@ async def collect(
             f"{username}: {message.text}"
         )
 
+        # Идея 4: Случайный мудрый комментарий в разговор (шанс 1%, но не чаще 1 раза в 30 мин)
+        now = datetime.now(TZ)
+        if (now - last_random_comment_time) > timedelta(minutes=30):
+            if random.random() < 0.01:  # 1% шанс
+                last_random_comment_time = now
+                comment = await generate_random_remark(message.text)
+                if comment:
+                    await message.reply(f"🐱 <i>{html.escape(comment)}</i>")
+
 
     except Exception as e:
         logging.error(
@@ -420,8 +480,35 @@ async def collect(
 
 
 # =====================================================
-# GEMINI
+# GEMINI FUNCTIONS
 # =====================================================
+
+async def ask_wisdom(user_question: str) -> str:
+
+    prompt = f"""
+Ты — древний и ироничный мудрец Мяумура из Иркутска.
+Тебе задали вопрос: "{user_question}"
+
+Дай короткий (2-4 предложения), глубинно-мудрый, философский, но при этом с лёгкой иронией и юмором ответ.
+Не используй обращений по имени, не упоминай AI, Telegram и нейросети.
+"""
+
+    try:
+        async with gemini_lock:
+            response = await gemini.aio.models.generate_content(
+                model="gemini-3-flash-preview",
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
+                    temperature=0.8
+                )
+            )
+
+        return response.text.strip()
+
+    except Exception as e:
+        logging.error(f"Gemini вопрос ошибка: {e}")
+        return "Иногда лучший ответ — это молчание. Но сейчас просто произошла техническая заминка."
+
 
 async def generate_text() -> dict:
 
@@ -464,8 +551,6 @@ async def generate_text() -> dict:
                 )
             )
 
-        # ИСПРАВЛЕНИЕ: SDK Google GenAI при использовании response_schema 
-        # возвращает чистую JSON строку, поэтому обрезать бэктики не нужно.
         raw_text = response.text.strip()
 
         return json.loads(raw_text)
@@ -484,8 +569,87 @@ async def generate_text() -> dict:
         }
 
 
+async def generate_summary() -> str:
+    """Генерирует краткую выжимку переписки за последние 12 часов."""
+    chat = await get_recent_messages(hours=12, limit=200)
+
+    prompt = f"""
+Ты — мудрый кот Мяумура. Посмотри переписку друзей за последнее время и сделай краткую, с иронией и юмором выжимку в 3-5 буллитах (о чем спорили, что обсуждали, какие были главные темы).
+
+Переписка:
+{chat}
+
+Формат ответа:
+• Тезис 1
+• Тезис 2
+• Тезис 3
+
+Не используй реальные имена. Напиши лаконично и живо.
+"""
+    try:
+        async with gemini_lock:
+            response = await gemini.aio.models.generate_content(
+                model="gemini-3-flash-preview",
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(temperature=0.7)
+            )
+        return response.text.strip()
+    except Exception as e:
+        logging.error(f"Ошибка создания summary: {e}")
+        return "Не удалось разобрать ваши перешёптывания..."
+
+
+async def generate_weekly_digest() -> str:
+    """Идея 2: Дайджест итогов недели."""
+    chat = await get_recent_messages(hours=168, limit=600)  # За 7 дней
+
+    prompt = f"""
+Ты — ироничный кот-мудрец Мяумура. Настали итоги недели!
+Проанализируй историю чата за неделю и составь красивый, смешной дайджест.
+
+История:
+{chat}
+
+Составь пост из 3 частей:
+1. 🏆 Главная тема недели (что больше всего волновало чат)
+2. 🎭 Атмосфера недели (в 1-2 предложениях)
+3. 🐾 Напутствие Мяумуры на следующую неделю (мудрый совет)
+
+Пиши без имён пользователей, с лёгкой иронией и теплом.
+"""
+    try:
+        async with gemini_lock:
+            response = await gemini.aio.models.generate_content(
+                model="gemini-3-flash-preview",
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(temperature=0.8)
+            )
+        return response.text.strip()
+    except Exception as e:
+        logging.error(f"Ошибка недельного дайджеста: {e}")
+        return "Неделя прошла так стремительно, что даже мудрец не успел её осмыслить."
+
+
+async def generate_random_remark(msg_text: str) -> str:
+    """Идея 4: Случайный реплика-комментарий к сообщению."""
+    prompt = f"""
+Ты — кот-мудрец Мяумура. Кто-то в чате только что сказал: "{msg_text}"
+Напиши ровно 1 очень короткое, философское или смешное предложение-реплику в ответ (как будто ты мудро промурчал свой комментарий в усы).
+"""
+    try:
+        async with gemini_lock:
+            response = await gemini.aio.models.generate_content(
+                model="gemini-3-flash-preview",
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(temperature=0.9)
+            )
+        return response.text.strip()
+    except Exception as e:
+        return ""
+
+
 # =====================================================
-# POST CREATOR
+# POST CREATORS
 # =====================================================
 
 async def create_daily_post(
@@ -550,6 +714,19 @@ async def create_daily_post(
             )
 
 
+async def send_weekly_digest():
+    """Отправка недельного дайджеста по расписанию."""
+    try:
+        digest = await generate_weekly_digest()
+        safe_digest = html.escape(digest)
+        await bot.send_message(
+            CHAT_ID,
+            f"📊 <b>Итоги недели от Мудреца Мяумуры:</b>\n\n{safe_digest}"
+        )
+        logging.info("Недельный дайджест успешно отправлен")
+    except Exception as e:
+        logging.error(f"Ошибка отправки дайджеста: {e}")
+
 
 # =====================================================
 # SCHEDULER
@@ -558,7 +735,7 @@ async def create_daily_post(
 def setup_scheduler():
 
 
-    # Каждый день 09:00 Иркутск
+    # Каждый день 09:00 Иркутск — Мысль дня
     scheduler.add_job(
 
         create_daily_post,
@@ -584,9 +761,31 @@ def setup_scheduler():
     )
 
 
+    # Воскресенье 20:00 Иркутск — Итоги недели
+    scheduler.add_job(
 
-    # Очистка базы раз в неделю
-    # Воскресенье 04:00 Иркутск
+        send_weekly_digest,
+
+        "cron",
+
+        day_of_week="sun",
+
+        hour=20,
+
+        minute=0,
+
+        id="weekly_digest",
+
+        replace_existing=True,
+
+        misfire_grace_time=3600,
+
+        coalesce=True
+
+    )
+
+
+    # Очистка базы раз в неделю (Воскресенье 04:00 Иркутск)
     scheduler.add_job(
 
         clear_old_messages,
@@ -615,7 +814,7 @@ def setup_scheduler():
 
 
     logging.info(
-        "Планировщик запущен: Иркутск 09:00"
+        "Планировщик запущен: Иркутск 09:00 (daily), Вс 20:00 (weekly)"
     )
 
 
@@ -676,12 +875,9 @@ async def main():
         )
 
 
-        # ИСПРАВЛЕНИЕ: Ждем корректного завершения всех задач планировщика,
-        # прежде чем закрыть соединение с базой данных
         scheduler.shutdown(
             wait=True
         )
-
 
 
         if web_runner:
