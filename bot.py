@@ -479,16 +479,16 @@ async def collect(
         )
 
 
-
 # =====================================================
 # GEMINI HELPER (RETRY & FALLBACK)
 # =====================================================
 
 async def call_gemini_safe(contents, config=None):
     """
-    Безопасный вызов Gemini API с обработкой ошибки 503 (UNAVAILABLE).
+    Безопасный вызов Gemini API с приоритетом на gemini-3-flash-preview 
+    и фоллбэком на стабильную 2.5-flash.
     """
-    models_to_try = ["gemini-2.5-flash", "gemini-1.5-flash"]
+    models_to_try = ["gemini-3-flash-preview", "gemini-2.5-flash"]
     
     async with gemini_lock:
         for model in models_to_try:
@@ -503,13 +503,15 @@ async def call_gemini_safe(contents, config=None):
                 except Exception as e:
                     err_str = str(e)
                     if "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str:
-                        logging.warning(f"Gemini 503 перегрузка ({model}, попытка {attempt+1}/3). Ждем...")
+                        logging.warning(f"Gemini перегрузка ({model}, попытка {attempt+1}/3). Ждем...")
                         await asyncio.sleep(2 * (attempt + 1))
+                    elif "404" in err_str or "NOT_FOUND" in err_str:
+                        logging.warning(f"Модель {model} не найдена (404). Пробуем следующую...")
+                        break  # Пропускаем эту модель и переходим к следующей в списке
                     else:
-                        logging.error(f"Неизвестная ошибка Gemini ({model}): {e}")
+                        logging.error(f"Ошибка Gemini ({model}): {e}")
                         break
         raise RuntimeError("Сервера Gemini временно недоступны. Попробуйте позже.")
-
 
 # =====================================================
 # GEMINI FUNCTIONS
