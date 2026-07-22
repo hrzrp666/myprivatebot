@@ -110,8 +110,9 @@ web_runner = None
 # =====================================================
 
 class DailyPostSchema(BaseModel):
-
     holiday: str
+    weather_kultuk: str
+    weather_svyatoy_nos: str
     quote: str
 
 
@@ -337,9 +338,9 @@ async def start(
 ):
 
     await message.answer(
-        "🧙 Мудрец Мяумура запущен.\n\n"
+        "🧙 Мудрец Мяумяура запущен.\n\n"
         "📜 <b>Мои возможности:</b>\n"
-        "• Каждое утро в 09:00 — Мысль дня\n"
+        "• Каждое утро в 09:00 — Мысль дня и погода\n"
         "• /question &lt;вопрос&gt; — Спросить мудреца\n"
         "• /summary — Краткая выжимка (что пропустили в чате)\n"
         "• Каждое воскресенье в 20:00 — Итоги недели"
@@ -386,7 +387,7 @@ async def question_cmd(
     
     safe_answer = html.escape(answer)
     await message.reply(
-        f"🧙 <b>Мудрец Мяумура молвит:</b>\n\n{safe_answer}"
+        f"🧙 <b>Мудрец Мяумяура молвит:</b>\n\n{safe_answer}"
     )
 
 
@@ -480,13 +481,46 @@ async def collect(
 
 
 # =====================================================
+# GEMINI HELPER (RETRY & FALLBACK)
+# =====================================================
+
+async def call_gemini_safe(contents, config=None):
+    """
+    Безопасный вызов Gemini API с обработкой ошибки 503 (UNAVAILABLE).
+    """
+    models_to_try = ["gemini-2.5-flash", "gemini-1.5-flash"]
+    
+    async with gemini_lock:
+        for model in models_to_try:
+            for attempt in range(3):
+                try:
+                    kwargs = {"model": model, "contents": contents}
+                    if config:
+                        kwargs["config"] = config
+                    
+                    response = await gemini.aio.models.generate_content(**kwargs)
+                    return response
+                except Exception as e:
+                    err_str = str(e)
+                    if "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str:
+                        logging.warning(f"Gemini 503 перегрузка ({model}, попытка {attempt+1}/3). Ждем...")
+                        await asyncio.sleep(2 * (attempt + 1))
+                    else:
+                        logging.error(f"Неизвестная ошибка Gemini ({model}): {e}")
+                        break
+        raise RuntimeError("Сервера Gemini временно недоступны. Попробуйте позже.")
+
+
+# =====================================================
 # GEMINI FUNCTIONS
 # =====================================================
 
 async def ask_wisdom(user_question: str) -> str:
 
     prompt = f"""
-Ты — древний и ироничный мудрец Мяумура из Иркутска.
+Ты — древний, опытный и ироничный мудрец Мяумяура. 
+ВАЖНОЕ ПРАВИЛО: Ты НЕ кот, не мяукаешь, не ассоциируешь себя с кошачьими и не используешь кошачью тематику/фразы. Ты мудрый человек-философ.
+
 Тебе задали вопрос: "{user_question}"
 
 Дай короткий (2-4 предложения), глубинно-мудрый, философский, но при этом с лёгкой иронией и юмором ответ.
@@ -494,20 +528,15 @@ async def ask_wisdom(user_question: str) -> str:
 """
 
     try:
-        async with gemini_lock:
-            response = await gemini.aio.models.generate_content(
-                model="gemini-3-flash-preview",
-                contents=prompt,
-                config=genai_types.GenerateContentConfig(
-                    temperature=0.8
-                )
-            )
-
+        response = await call_gemini_safe(
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(temperature=0.8)
+        )
         return response.text.strip()
 
     except Exception as e:
         logging.error(f"Gemini вопрос ошибка: {e}")
-        return "Иногда лучший ответ — это молчание. Но сейчас просто произошла техническая заминка."
+        return "В данный момент духи эфира перегружены. Спроси меня чуточку позже."
 
 
 async def generate_text() -> dict:
@@ -518,8 +547,10 @@ async def generate_text() -> dict:
 
 
     prompt = f"""
-Ты — мудрый участник компании друзей из Иркутска.
-Каждое утро создавай короткую мысль дня на основе последних разговоров.
+Ты — Мудрец Мяумяура, участник компании друзей.
+Ты НЕ кот и НЕ используешь кошачьи фразы. Ты ироничный и мудрый собеседник.
+
+Каждое утро создавай короткую мысль дня на основе последних разговоров, а также оцени вероятный прогноз погоды для двух точек.
 
 Дата:
 {current_date_str}
@@ -528,43 +559,36 @@ async def generate_text() -> dict:
 {chat}
 
 Правила для JSON полей (СТРОГО):
-- holiday: Напиши исключительно ОФИЦИАЛЬНЫЙ, общеизвестный реальный праздник или памятную дату, которая действительно выпадает на этот день ({current_date_str}) в мире или России. Категорически ЗАПРЕЩЕНО выдумывать шуточные или фейковые праздники на основе контекста разговоров (никаких дней гулей и т.д.).
-- quote: Мудрая короткая мысль (1-3 предложения) с лёгким юмором и иронией, которая тонко обыгрывает или учитывает настроение разговоров в чате. Вот здесь ты можешь шутить, подкалывать и иронизировать над темами из разговоров.
+- holiday: Напиши исключительно ОФИЦИАЛЬНЫЙ, общеизвестный реальный праздник или памятную дату, которая действительно выпадает на этот день ({current_date_str}) в мире или России. Категорически ЗАПРЕЩЕНО выдумывать шуточные или фейковые праздники на основе контекста разговоров.
+- weather_kultuk: Реалистичная сводка погоды на сегодня в рабочем посёлке Култук, Иркутской области (температура °C, облачность/осадки, ветер). Вкратце (1 предложение).
+- weather_svyatoy_nos: Реалистичная сводка погоды на сегодня в мысе Святой Нос, Мурманской области (температура °C, облачность/осадки, ветер). Вкратце (1 предложение).
+- quote: Мудрая короткая мысль (1-3 предложения) с лёгким юмором и иронией, которая тонко обыгрывает или учитывает настроение разговоров в чате. 
 
 Дополнительные правила:
 - мысль должна быть живой и вызывать улыбку;
-- не использовать имена людей;
-- не упоминать Telegram, бота или технологии;
-- не копировать сообщения дословно.
+- не использовать имена людей и кошачьих словечек;
+- не упоминать Telegram, бота или технологии.
 """
 
     try:
-
-        async with gemini_lock:
-            response = await gemini.aio.models.generate_content(
-                model="gemini-3-flash-preview",
-                contents=prompt,
-                config=genai_types.GenerateContentConfig(
-                    temperature=0.8,
-                    response_mime_type="application/json",
-                    response_schema=DailyPostSchema
-                )
+        response = await call_gemini_safe(
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                temperature=0.8,
+                response_mime_type="application/json",
+                response_schema=DailyPostSchema
             )
-
-        raw_text = response.text.strip()
-
-        return json.loads(raw_text)
-
-
-    except Exception as e:
-
-        logging.error(
-            f"Gemini ошибка: {e}"
         )
 
+        raw_text = response.text.strip()
+        return json.loads(raw_text)
 
+    except Exception as e:
+        logging.error(f"Gemini ошибка: {e}")
         return {
             "holiday": "День спокойных решений",
+            "weather_kultuk": "Около +15°C, облачно с прояснениями",
+            "weather_svyatoy_nos": "Около +8°C, свежий морской ветер",
             "quote": "Даже самый длинный путь начинается с маленького шага, а иногда — с перезапуска утром."
         }
 
@@ -574,7 +598,7 @@ async def generate_summary() -> str:
     chat = await get_recent_messages(hours=12, limit=200)
 
     prompt = f"""
-Ты — Мудрец Мяумура. Посмотри переписку друзей за последнее время и сделай краткую, с иронией и юмором выжимку в 3-5 буллитах (о чем спорили, что обсуждали, какие были главные темы).
+Ты — Мудрец Мяумяура (НЕ кот, никаких кошачьих фраз). Посмотри переписку друзей за последнее время и сделай краткую, с иронией и юмором выжимку в 3-5 буллитах (о чем спорили, что обсуждали, какие были главные темы).
 
 Переписка:
 {chat}
@@ -587,16 +611,14 @@ async def generate_summary() -> str:
 Не используй реальные имена. Напиши лаконично и живо.
 """
     try:
-        async with gemini_lock:
-            response = await gemini.aio.models.generate_content(
-                model="gemini-3-flash-preview",
-                contents=prompt,
-                config=genai_types.GenerateContentConfig(temperature=0.7)
-            )
+        response = await call_gemini_safe(
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(temperature=0.7)
+        )
         return response.text.strip()
     except Exception as e:
         logging.error(f"Ошибка создания summary: {e}")
-        return "Не удалось разобрать ваши перешёптывания..."
+        return "Не удалось разобрать ваши перешёптывания — сервера перегружены."
 
 
 async def generate_weekly_digest() -> str:
@@ -604,7 +626,7 @@ async def generate_weekly_digest() -> str:
     chat = await get_recent_messages(hours=168, limit=600)  # За 7 дней
 
     prompt = f"""
-Ты — ироничный Мудрец Мяумура. Настали итоги недели!
+Ты — ироничный Мудрец Мяумяура (без кошачьей атрибутики и мяуканья). Настали итоги недели!
 Проанализируй историю чата за неделю и составь красивый, смешной дайджест.
 
 История:
@@ -613,17 +635,15 @@ async def generate_weekly_digest() -> str:
 Составь пост из 3 частей:
 1. 🏆 Главная тема недели (что больше всего волновало чат)
 2. 🎭 Атмосфера недели (в 1-2 предложениях)
-3. 📜 Напутствие Мяумуры на следующую неделю (мудрый совет)
+3. 📜 Напутствие Мяумяуры на следующую неделю (мудрый совет)
 
 Пиши без имён пользователей, с лёгкой иронией и теплом.
 """
     try:
-        async with gemini_lock:
-            response = await gemini.aio.models.generate_content(
-                model="gemini-3-flash-preview",
-                contents=prompt,
-                config=genai_types.GenerateContentConfig(temperature=0.8)
-            )
+        response = await call_gemini_safe(
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(temperature=0.8)
+        )
         return response.text.strip()
     except Exception as e:
         logging.error(f"Ошибка недельного дайджеста: {e}")
@@ -633,16 +653,14 @@ async def generate_weekly_digest() -> str:
 async def generate_random_remark(msg_text: str) -> str:
     """Случайная реплика-комментарий к сообщению."""
     prompt = f"""
-Ты — Мудрец Мяумура. Кто-то в чате только что сказал: "{msg_text}"
+Ты — Мудрец Мяумяура (без кошачьих фразочек). Кто-то в чате только что сказал: "{msg_text}"
 Напиши ровно 1 очень короткое, философское или смешное предложение-реплику в ответ.
 """
     try:
-        async with gemini_lock:
-            response = await gemini.aio.models.generate_content(
-                model="gemini-3-flash-preview",
-                contents=prompt,
-                config=genai_types.GenerateContentConfig(temperature=0.9)
-            )
+        response = await call_gemini_safe(
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(temperature=0.9)
+        )
         return response.text.strip()
     except Exception as e:
         return ""
@@ -676,16 +694,19 @@ async def create_daily_post(
             data = await generate_text()
 
 
-            safe_holiday = html.escape(data['holiday'])
-            safe_quote = html.escape(data['quote'])
+            safe_holiday = html.escape(data.get('holiday', ''))
+            safe_quote = html.escape(data.get('quote', ''))
+            safe_kultuk = html.escape(data.get('weather_kultuk', ''))
+            safe_svyatoy_nos = html.escape(data.get('weather_svyatoy_nos', ''))
 
             text = (
-
-                f"📅 Сегодня:\n"
+                f"📅 <b>Сегодня:</b>\n"
                 f"{safe_holiday}\n\n"
-                f"✨ Мысль дня:\n"
+                f"🌤 <b>Погода на сегодня:</b>\n"
+                f"• <b>р.п. Култук (Иркутская обл.):</b> {safe_kultuk}\n"
+                f"• <b>мыс Святой Нос (Мурманская обл.):</b> {safe_svyatoy_nos}\n\n"
+                f"✨ <b>Мысль дня от Мудреца Мяумяура:</b>\n"
                 f"«{safe_quote}»"
-
             )
 
 
@@ -702,7 +723,7 @@ async def create_daily_post(
 
 
             logging.info(
-                "Мысль дня отправлена"
+                "Мысль дня и погода отправлены"
             )
 
 
@@ -721,7 +742,7 @@ async def send_weekly_digest():
         safe_digest = html.escape(digest)
         await bot.send_message(
             CHAT_ID,
-            f"📊 <b>Итоги недели от Мудреца Мяумуры:</b>\n\n{safe_digest}"
+            f"📊 <b>Итоги недели от Мудреца Мяумяура:</b>\n\n{safe_digest}"
         )
         logging.info("Недельный дайджест успешно отправлен")
     except Exception as e:
@@ -735,7 +756,7 @@ async def send_weekly_digest():
 def setup_scheduler():
 
 
-    # Каждый день 09:00 Иркутск — Мысль дня
+    # Каждый день 09:00 Иркутск — Мысль дня и погода
     scheduler.add_job(
 
         create_daily_post,
@@ -850,7 +871,7 @@ async def main():
 
 
     logging.info(
-        "🧙 Мудрец Мяумура работает"
+        "🧙 Мудрец Мяумяура работает"
     )
 
 
