@@ -88,6 +88,26 @@ logging.basicConfig(
 )
 
 
+# =====================================================
+# CONFIG FOR NEW FEATURES
+# =====================================================
+
+# Порог опасного ветра (в м/с)
+WIND_WARNING_THRESHOLD = 15.0
+
+# Статусы сервисов для Uptime-мониторинга
+SERVICES_STATUS = {
+    "Telegram API": True,
+    "Steam": True,
+    "VK": True
+}
+
+TARGET_SERVICES = {
+    "Telegram API": "https://api.telegram.org",
+    "Steam": "https://store.steampowered.com",
+    "VK": "https://vk.com"
+}
+
 
 # =====================================================
 # INIT
@@ -208,6 +228,82 @@ async def get_weather_day(lat: float, lon: float) -> dict:
     except Exception as e:
         logging.error(f"Ошибка получения погоды ({lat}, {lon}): {e}")
         return fallback
+
+
+# =====================================================
+# MONITORS & ALERTS (NEW)
+# =====================================================
+
+async def check_storm_warnings():
+    """Проверка экстремальной погоды (шторм, порывы ветра) для Култука и Святого Носа."""
+    locations = [
+        ("Култук", KULTUK_LAT, KULTUK_LON),
+        ("Святой Нос", SVYATOY_NOS_LAT, SVYATOY_NOS_LON)
+    ]
+    
+    alerts = []
+    
+    for name, lat, lon in locations:
+        url = (
+            f"https://api.open-meteo.com/v1/forecast"
+            f"?latitude={lat}&longitude={lon}"
+            f"&current=wind_speed_10m,wind_gusts_10m,weather_code"
+            f"&timezone=Asia%2FIrkutsk"
+        )
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=10) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        current = data.get("current", {})
+                        
+                        wind_speed = current.get("wind_speed_10m", 0) / 3.6  # перевод км/ч в м/с
+                        wind_gusts = current.get("wind_gusts_10m", 0) / 3.6
+                        
+                        if wind_speed >= WIND_WARNING_THRESHOLD or wind_gusts >= WIND_WARNING_THRESHOLD:
+                            alerts.append(
+                                f"⚠️ <b>{name}:</b> Штормовой ветер! "
+                                f"Скорость: <b>{round(wind_speed, 1)} м/с</b> "
+                                f"(порывы до <b>{round(wind_gusts, 1)} м/с</b>)"
+                            )
+        except Exception as e:
+            logging.error(f"Ошибка проверки шторма для {name}: {e}")
+            
+    if alerts:
+        text = "🚨 <b>ШТОРМОВОЕ ПРЕДУПРЕЖДЕНИЕ (Байкал):</b>\n\n" + "\n".join(alerts)
+        await bot.send_message(CHAT_ID, text)
+
+
+async def check_uptime():
+    """Проверка доступности Steam, Telegram и VK."""
+    global SERVICES_STATUS
+    
+    async with aiohttp.ClientSession() as session:
+        for name, url in TARGET_SERVICES.items():
+            is_up = False
+            try:
+                async with session.get(url, timeout=5) as resp:
+                    if resp.status < 400:
+                        is_up = True
+            except Exception:
+                is_up = False
+
+            previous_status = SERVICES_STATUS.get(name, True)
+            
+            if is_up != previous_status:
+                SERVICES_STATUS[name] = is_up
+                if not is_up:
+                    await bot.send_message(
+                        CHAT_ID, 
+                        f"🔴 <b>Сбой сервиса!</b>\n{name} недоступен или не отвечает."
+                    )
+                    logging.warning(f"Сервис {name} упал!")
+                else:
+                    await bot.send_message(
+                        CHAT_ID, 
+                        f"🟢 <b>Сервис восстановлен!</b>\n{name} снова работает в штатном режиме."
+                    )
+                    logging.info(f"Сервис {name} поднялся!")
 
 
 # =====================================================
@@ -436,6 +532,7 @@ async def start(
         "• Каждое утро в 09:00 — Мысль дня и погода\n"
         "• /question &lt;вопрос&gt; — Спросить мудреца\n"
         "• /summary — Краткая выжимка (что пропустили в чате)\n"
+        "• /plans — Извлечь планы и даты из переписки\n"
         "• Каждое воскресенье в 20:00 — Итоги недели"
     )
 
@@ -497,6 +594,17 @@ async def summary_cmd(
     await status_msg.edit_text(
         f"📜 <b>Краткая выжимка разговоров:</b>\n\n{safe_summary}"
     )
+
+
+@dp.message(Command("plans"))
+async def plans_cmd(
+    message: types.Message
+):
+    """Извлечение планов и договоренностей за 24 часа."""
+    status_msg = await message.reply("🔍 Анализирую договоренности в чате...")
+    plans = await extract_chat_plans()
+    safe_plans = html.escape(plans)
+    await status_msg.edit_text(f"📌 <b>Зафиксированные планы из чата:</b>\n\n{safe_plans}")
 
 
 # =====================================================
@@ -712,6 +820,32 @@ async def generate_summary() -> str:
         return "Не удалось разобрать ваши перешёптывания — сервера перегружены."
 
 
+async def extract_chat_plans() -> str:
+    """Извлечение дат и договоренностей из сообщений чата за 24 часа."""
+    chat = await get_recent_messages(hours=24, limit=300)
+
+    if chat == "В чате было спокойно.":
+        return "За последние 24 часа никаких планов не обсуждалось."
+
+    prompt = (
+        "Проанализируй историю переписки чата за сутки и выдели ВСЕ конкретные планы, встречи, даты, "
+        "поездки или договоренности, о которых упоминали участники.\n"
+        "Пиши кратко, только факты в виде маркированного списка.\n"
+        "Если конкретных планов и дат не было — напиши ровно одну фразу: 'Конкретных планов не зафиксировано.'\n\n"
+        f"История чата:\n{chat}"
+    )
+
+    try:
+        response = await call_gemini_safe(
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(temperature=0.2)
+        )
+        return response.text.strip()
+    except Exception as e:
+        logging.error(f"Ошибка извлечения планов: {e}")
+        return "Не удалось проанализировать планы."
+
+
 async def generate_weekly_digest() -> str:
     """Дайджест итогов недели."""
     chat = await get_recent_messages(hours=168, limit=600)  # За 7 дней
@@ -916,12 +1050,32 @@ def setup_scheduler():
     )
 
 
+    # Проверка Uptime (Steam, TG, VK) каждые 5 минут
+    scheduler.add_job(
+        check_uptime,
+        "interval",
+        minutes=5,
+        id="check_uptime",
+        replace_existing=True
+    )
+
+
+    # Проверка штормовых предупреждений каждые 30 минут
+    scheduler.add_job(
+        check_storm_warnings,
+        "interval",
+        minutes=30,
+        id="check_storm",
+        replace_existing=True
+    )
+
+
 
     scheduler.start()
 
 
     logging.info(
-        "Планировщик запущен: Иркутск 09:00 (daily), Вс 20:00 (weekly)"
+        "Планировщик запущен: Иркутск 09:00 (daily), Вс 20:00 (weekly), Uptime (5м), Storm (30м)"
     )
 
 
