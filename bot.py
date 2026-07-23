@@ -5,6 +5,7 @@ import os
 import json
 import html
 import random
+import aiohttp
 
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -48,6 +49,33 @@ if not CHAT_ID:
 
 
 CHAT_ID = int(CHAT_ID)
+
+
+# Координаты для погоды Open-Meteo
+KULTUK_LAT, KULTUK_LON = 51.7208, 103.6828
+SVYATOY_NOS_LAT, SVYATOY_NOS_LON = 68.0811, 39.7619
+
+WEATHER_CODES = {
+    0: "ясно",
+    1: "преимущественно ясно",
+    2: "переменная облачность",
+    3: "пасмурно",
+    45: "туман",
+    48: "изморозь",
+    51: "слабая морось",
+    53: "морось",
+    55: "сильная морось",
+    61: "небольшой дождь",
+    63: "дождь",
+    65: "сильный дождь",
+    71: "небольшой снег",
+    73: "снег",
+    75: "сильный снег",
+    80: "ливень",
+    81: "сильный ливень",
+    82: "очень сильный ливень",
+    95: "гроза"
+}
 
 
 # Иркутское время
@@ -111,10 +139,92 @@ web_runner = None
 
 class DailyPostSchema(BaseModel):
     holiday: str
-    weather_kultuk: str
-    weather_svyatoy_nos: str
     quote: str
 
+
+# =====================================================
+# OPEN-METEO WEATHER API
+# =====================================================
+
+async def get_weather_day(lat: float, lon: float) -> dict:
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat}&longitude={lon}"
+        "&hourly=temperature_2m,weather_code,wind_speed_10m,precipitation_probability"
+        "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+        "&forecast_days=1"
+        "&timezone=auto"
+    )
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=15) as resp:
+                data = await resp.json()
+
+        hourly = data["hourly"]
+        daily = data["daily"]
+        times = hourly["time"]
+
+        # Мин / Макс температура и макс. вероятность осадков за день
+        temp_min = round(daily["temperature_2m_min"][0])
+        temp_max = round(daily["temperature_2m_max"][0])
+        pop_max = daily["precipitation_probability_max"][0]
+
+        target_hours = {
+            "🌅 Утро": "09:00",
+            "☀️ День": "15:00",
+            "🌆 Вечер": "21:00"
+        }
+
+        periods = {}
+        for title, hour_str in target_hours.items():
+            idx = next((i for i, t in enumerate(times) if t.endswith(hour_str)), None)
+            
+            if idx is not None:
+                temp = round(hourly["temperature_2m"][idx])
+                wind = round(hourly["wind_speed_10m"][idx])
+                code = hourly["weather_code"][idx]
+                weather = WEATHER_CODES.get(code, "неизвестно")
+                periods[title] = f"{temp}°C, {weather}, ветер {wind} км/ч"
+            else:
+                periods[title] = "нет данных"
+
+        # Формирование штормовых / погодных предупреждений
+        warnings = []
+        max_wind = max(hourly["wind_speed_10m"]) if "wind_speed_10m" in hourly else 0
+        weather_codes = set(hourly["weather_code"])
+
+        if max_wind >= 30:
+            warnings.append(f"⚠️ Ожидается сильный ветер (до {round(max_wind)} км/ч)!")
+        
+        # Проверяем коды осадков (дождь, снег, ливень, гроза)
+        rain_codes = {51, 53, 55, 61, 63, 65, 80, 81, 82}
+        snow_codes = {71, 73, 75}
+        storm_codes = {95}
+
+        if weather_codes.intersection(storm_codes):
+            warnings.append("⚡ Возм. гроза!")
+        elif weather_codes.intersection(rain_codes):
+            warnings.append("🌧 Возм. дождь!")
+        elif weather_codes.intersection(snow_codes):
+            warnings.append("❄️ Возм. снег!")
+
+        return {
+            "temp_min": temp_min,
+            "temp_max": temp_max,
+            "pop_max": pop_max,
+            "periods": periods,
+            "warning": " ".join(warnings) if warnings else None
+        }
+    except Exception as e:
+        logging.error(f"Ошибка получения погоды ({lat}, {lon}): {e}")
+        return {
+            "temp_min": "-",
+            "temp_max": "-",
+            "pop_max": 0,
+            "periods": {"🌅 Утро": "нет данных", "☀️ День": "нет данных", "🌆 Вечер": "нет данных"},
+            "warning": None
+        }
 
 
 # =====================================================
@@ -552,7 +662,7 @@ async def generate_text() -> dict:
 Ты — Мудрец Мяумяура, участник компании друзей.
 Ты НЕ кот и НЕ используешь кошачьи фразы. Ты ироничный и мудрый собеседник.
 
-Каждое утро создавай короткую мысль дня на основе последних разговоров, а также оцени вероятный прогноз погоды для двух точек.
+Каждое утро создавай короткую мысль дня на основе последних разговоров и указывай праздник.
 
 Дата:
 {current_date_str}
@@ -562,8 +672,6 @@ async def generate_text() -> dict:
 
 Правила для JSON полей (СТРОГО):
 - holiday: Напиши исключительно ОФИЦИАЛЬНЫЙ, общеизвестный реальный праздник или памятную дату, которая действительно выпадает на этот день ({current_date_str}) в мире или России. Категорически ЗАПРЕЩЕНО выдумывать шуточные или фейковые праздники на основе контекста разговоров.
-- weather_kultuk: Реалистичная сводка погоды на сегодня в рабочем посёлке Култук, Иркутской области (температура °C, облачность/осадки, ветер). Вкратце (1 предложение).
-- weather_svyatoy_nos: Реалистичная сводка погоды на сегодня в мысе Святой Нос, Мурманской области (температура °C, облачность/осадки, ветер). Вкратце (1 предложение).
 - quote: Мудрая короткая мысль (1-3 предложения) с лёгким юмором и иронией, которая тонко обыгрывает или учитывает настроение разговоров в чате. 
 
 Дополнительные правила:
@@ -589,8 +697,6 @@ async def generate_text() -> dict:
         logging.error(f"Gemini ошибка: {e}")
         return {
             "holiday": "День спокойных решений",
-            "weather_kultuk": "Около +15°C, облачно с прояснениями",
-            "weather_svyatoy_nos": "Около +8°C, свежий морской ветер",
             "quote": "Даже самый длинный путь начинается с маленького шага, а иногда — с перезапуска утром."
         }
 
@@ -693,20 +799,34 @@ async def create_daily_post(
 
         try:
 
-            data = await generate_text()
+            # Параллельно получаем мысль от Gemini и точную погоду от Open-Meteo
+            gemini_task = generate_text()
+            kultuk_task = get_weather_day(KULTUK_LAT, KULTUK_LON)
+            svyatoy_task = get_weather_day(SVYATOY_NOS_LAT, SVYATOY_NOS_LON)
 
+            data, kultuk, svyatoy = await asyncio.gather(
+                gemini_task,
+                kultuk_task,
+                svyatoy_task
+            )
 
             safe_holiday = html.escape(data.get('holiday', ''))
             safe_quote = html.escape(data.get('quote', ''))
-            safe_kultuk = html.escape(data.get('weather_kultuk', ''))
-            safe_svyatoy_nos = html.escape(data.get('weather_svyatoy_nos', ''))
 
             text = (
                 f"📅 <b>Сегодня:</b>\n"
                 f"{safe_holiday}\n\n"
-                f"🌤 <b>Погода на сегодня:</b>\n"
-                f"• <b>р.п. Култук (Иркутская обл.):</b> {safe_kultuk}\n"
-                f"• <b>мыс Святой Нос (Мурманская обл.):</b> {safe_svyatoy_nos}\n\n"
+
+                f"🌤 <b>Култук</b>\n"
+                f"🌅 Утро: {kultuk['🌅 Утро']}\n"
+                f"☀️ День: {kultuk['☀️ День']}\n"
+                f"🌆 Вечер: {kultuk['🌆 Вечер']}\n\n"
+
+                f"🌊 <b>Святой Нос</b>\n"
+                f"🌅 Утро: {svyatoy['🌅 Утро']}\n"
+                f"☀️ День: {svyatoy['☀️ День']}\n"
+                f"🌆 Вечер: {svyatoy['🌆 Вечер']}\n\n"
+
                 f"✨ <b>Мысль дня от Мудреца Мяумяура:</b>\n"
                 f"«{safe_quote}»"
             )
