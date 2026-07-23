@@ -147,12 +147,11 @@ class DailyPostSchema(BaseModel):
 # =====================================================
 
 async def get_weather_day(lat: float, lon: float) -> dict:
-    # Явно запрашиваем прогноз для часового пояса Иркутска (Asia/Irkutsk)
     url = (
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={lat}&longitude={lon}"
         "&hourly=temperature_2m,weather_code,wind_speed_10m"
-        "&forecast_days=2"  # Запрашиваем 2 дня, чтобы точно зацепить все часы
+        "&forecast_days=2"
         "&timezone=Asia%2FIrkutsk"
     )
 
@@ -164,41 +163,43 @@ async def get_weather_day(lat: float, lon: float) -> dict:
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=15) as resp:
+            async with session.get(url, timeout=10) as resp:
                 if resp.status != 200:
-                    logging.error(f"Open-Meteo статус {resp.status}")
+                    logging.error(f"Open-Meteo error status: {resp.status}")
                     return fallback
                 data = await resp.json()
 
-        hourly = data.get("hourly")
-        if not hourly or "time" not in hourly:
+        hourly = data.get("hourly", {})
+        times = hourly.get("time", [])
+        temps = hourly.get("temperature_2m", [])
+        winds = hourly.get("wind_speed_10m", [])
+        codes = hourly.get("weather_code", [])
+
+        if not times or not temps:
             return fallback
 
-        times = hourly["time"]
+        today_str = datetime.now(TZ).strftime("%Y-%m-%d")
         
-        # Нужные часы в виде чисел
         target_hours = {
             "🌅 Утро": 9,
             "☀️ День": 15,
             "🌆 Вечер": 21
         }
 
-        # Ближайшая дата сегодня
-        today_str = datetime.now(TZ).strftime("%Y-%m-%d")
-
         result = {}
-        for title, hour_num in target_hours.items():
-            # Формируем искомую строку вида "2026-07-23T09:00"
-            expected_time = f"{today_str}T{hour_num:02d}:00"
+        for title, hour in target_hours.items():
+            expected_pattern = f"{today_str}T{hour:02d}:00"
             
-            idx = next((i for i, t in enumerate(times) if expected_time in t), None)
-            
-            if idx is not None and idx < len(hourly.get("temperature_2m", [])):
-                temp = round(hourly["temperature_2m"][idx])
-                wind = round(hourly["wind_speed_10m"][idx])
-                code = hourly["weather_code"][idx]
-                weather = WEATHER_CODES.get(code, "ясно")
-                result[title] = f"{temp}°C, {weather}, ветер {wind} км/ч"
+            # Ищем индекс нужного часа
+            idx = next((i for i, t in enumerate(times) if expected_pattern in t), None)
+
+            if idx is not None and idx < len(temps) and temps[idx] is not None:
+                t_val = round(temps[idx])
+                w_val = round(winds[idx]) if idx < len(winds) and winds[idx] is not None else 0
+                c_val = codes[idx] if idx < len(codes) and codes[idx] is not None else 0
+                
+                weather_desc = WEATHER_CODES.get(c_val, "ясно")
+                result[title] = f"{t_val}°C, {weather_desc}, ветер {w_val} км/ч"
             else:
                 result[title] = "нет данных"
 
