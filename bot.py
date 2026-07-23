@@ -147,84 +147,66 @@ class DailyPostSchema(BaseModel):
 # =====================================================
 
 async def get_weather_day(lat: float, lon: float) -> dict:
+    # Явно запрашиваем прогноз для часового пояса Иркутска (Asia/Irkutsk)
     url = (
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={lat}&longitude={lon}"
-        "&hourly=temperature_2m,weather_code,wind_speed_10m,precipitation_probability"
-        "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
-        "&forecast_days=1"
-        "&timezone=auto"
+        "&hourly=temperature_2m,weather_code,wind_speed_10m"
+        "&forecast_days=2"  # Запрашиваем 2 дня, чтобы точно зацепить все часы
+        "&timezone=Asia%2FIrkutsk"
     )
+
+    fallback = {
+        "🌅 Утро": "нет данных",
+        "☀️ День": "нет данных",
+        "🌆 Вечер": "нет данных"
+    }
 
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=15) as resp:
+                if resp.status != 200:
+                    logging.error(f"Open-Meteo статус {resp.status}")
+                    return fallback
                 data = await resp.json()
 
-        hourly = data["hourly"]
-        daily = data["daily"]
+        hourly = data.get("hourly")
+        if not hourly or "time" not in hourly:
+            return fallback
+
         times = hourly["time"]
-
-        # Мин / Макс температура и макс. вероятность осадков за день
-        temp_min = round(daily["temperature_2m_min"][0])
-        temp_max = round(daily["temperature_2m_max"][0])
-        pop_max = daily["precipitation_probability_max"][0]
-
+        
+        # Нужные часы в виде чисел
         target_hours = {
-            "🌅 Утро": "09:00",
-            "☀️ День": "15:00",
-            "🌆 Вечер": "21:00"
+            "🌅 Утро": 9,
+            "☀️ День": 15,
+            "🌆 Вечер": 21
         }
 
-        periods = {}
-        for title, hour_str in target_hours.items():
-            idx = next((i for i, t in enumerate(times) if t.endswith(hour_str)), None)
+        # Ближайшая дата сегодня
+        today_str = datetime.now(TZ).strftime("%Y-%m-%d")
+
+        result = {}
+        for title, hour_num in target_hours.items():
+            # Формируем искомую строку вида "2026-07-23T09:00"
+            expected_time = f"{today_str}T{hour_num:02d}:00"
             
-            if idx is not None:
+            idx = next((i for i, t in enumerate(times) if expected_time in t), None)
+            
+            if idx is not None and idx < len(hourly.get("temperature_2m", [])):
                 temp = round(hourly["temperature_2m"][idx])
                 wind = round(hourly["wind_speed_10m"][idx])
                 code = hourly["weather_code"][idx]
-                weather = WEATHER_CODES.get(code, "неизвестно")
-                periods[title] = f"{temp}°C, {weather}, ветер {wind} км/ч"
+                weather = WEATHER_CODES.get(code, "ясно")
+                result[title] = f"{temp}°C, {weather}, ветер {wind} км/ч"
             else:
-                periods[title] = "нет данных"
+                result[title] = "нет данных"
 
-        # Формирование штормовых / погодных предупреждений
-        warnings = []
-        max_wind = max(hourly["wind_speed_10m"]) if "wind_speed_10m" in hourly else 0
-        weather_codes = set(hourly["weather_code"])
+        return result
 
-        if max_wind >= 30:
-            warnings.append(f"⚠️ Ожидается сильный ветер (до {round(max_wind)} км/ч)!")
-        
-        # Проверяем коды осадков (дождь, снег, ливень, гроза)
-        rain_codes = {51, 53, 55, 61, 63, 65, 80, 81, 82}
-        snow_codes = {71, 73, 75}
-        storm_codes = {95}
-
-        if weather_codes.intersection(storm_codes):
-            warnings.append("⚡ Возм. гроза!")
-        elif weather_codes.intersection(rain_codes):
-            warnings.append("🌧 Возм. дождь!")
-        elif weather_codes.intersection(snow_codes):
-            warnings.append("❄️ Возм. снег!")
-
-        return {
-            "temp_min": temp_min,
-            "temp_max": temp_max,
-            "pop_max": pop_max,
-            "periods": periods,
-            "warning": " ".join(warnings) if warnings else None
-        }
     except Exception as e:
         logging.error(f"Ошибка получения погоды ({lat}, {lon}): {e}")
-        return {
-            "temp_min": "-",
-            "temp_max": "-",
-            "pop_max": 0,
-            "periods": {"🌅 Утро": "нет данных", "☀️ День": "нет данных", "🌆 Вечер": "нет данных"},
-            "warning": None
-        }
+        return fallback
 
 
 # =====================================================
@@ -778,27 +760,14 @@ async def generate_random_remark(msg_text: str) -> str:
 # POST CREATORS
 # =====================================================
 
-async def create_daily_post(
-    force=False
-):
-
+async def create_daily_post(force=False):
     async with post_lock:
-
-
         if not force:
-
             if await was_post_today():
-
-                logging.info(
-                    "Пост уже отправлялся сегодня"
-                )
-
+                logging.info("Пост уже отправлялся сегодня")
                 return
 
-
-
         try:
-
             # Параллельно получаем мысль от Gemini и точную погоду от Open-Meteo
             gemini_task = generate_text()
             kultuk_task = get_weather_day(KULTUK_LAT, KULTUK_LON)
@@ -813,48 +782,42 @@ async def create_daily_post(
             safe_holiday = html.escape(data.get('holiday', ''))
             safe_quote = html.escape(data.get('quote', ''))
 
+            # Безопасное извлечение погоды с дефолтным значением
+            k_morning = kultuk.get('🌅 Утро', 'нет данных')
+            k_day = kultuk.get('☀️ День', 'нет данных')
+            k_evening = kultuk.get('🌆 Вечер', 'нет данных')
+
+            s_morning = svyatoy.get('🌅 Утро', 'нет данных')
+            s_day = svyatoy.get('☀️ День', 'нет данных')
+            s_evening = svyatoy.get('🌆 Вечер', 'нет данных')
+
             text = (
                 f"📅 <b>Сегодня:</b>\n"
                 f"{safe_holiday}\n\n"
 
                 f"🌤 <b>Култук</b>\n"
-                f"🌅 Утро: {kultuk['🌅 Утро']}\n"
-                f"☀️ День: {kultuk['☀️ День']}\n"
-                f"🌆 Вечер: {kultuk['🌆 Вечер']}\n\n"
+                f"🌅 Утро: {k_morning}\n"
+                f"☀️ День: {k_day}\n"
+                f"🌆 Вечер: {k_evening}\n\n"
 
                 f"🌊 <b>Святой Нос</b>\n"
-                f"🌅 Утро: {svyatoy['🌅 Утро']}\n"
-                f"☀️ День: {svyatoy['☀️ День']}\n"
-                f"🌆 Вечер: {svyatoy['🌆 Вечер']}\n\n"
+                f"🌅 Утро: {s_morning}\n"
+                f"☀️ День: {s_day}\n"
+                f"🌆 Вечер: {s_evening}\n\n"
 
                 f"✨ <b>Мысль дня от Мудреца Мяумяура:</b>\n"
                 f"«{safe_quote}»"
             )
 
-
-            await bot.send_message(
-                CHAT_ID,
-                text
-            )
-
+            await bot.send_message(CHAT_ID, text)
 
             if not force:
-
                 await save_post_today()
 
-
-
-            logging.info(
-                "Мысль дня и погода отправлены"
-            )
-
-
+            logging.info("Мысль дня и погода отправлены")
 
         except Exception as e:
-
-            logging.exception(
-                f"Ошибка создания поста: {e}"
-            )
+            logging.exception(f"Ошибка создания поста: {e}")
 
 
 async def send_weekly_digest():
