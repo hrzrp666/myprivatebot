@@ -446,30 +446,6 @@ async def get_recent_messages(hours=24, limit=300):
 
 
 
-async def get_user_last_messages(username_target: str, limit: int = 10) -> list[str]:
-    """Извлекает последние N сообщений конкретного пользователя из базы."""
-    async with db_lock:
-        async with db_conn.execute(
-            """
-            SELECT text
-            FROM messages
-            WHERE username = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (username_target, limit)
-        ) as cursor:
-            rows = await cursor.fetchall()
-
-    if not rows:
-        return []
-
-    messages = [r[0] for r in rows]
-    messages.reverse()
-    return messages
-
-
-
 async def clear_old_messages():
 
     limit_time = (
@@ -649,13 +625,16 @@ async def collect(
     if message.chat.id != CHAT_ID:
         return
 
+
     # только текст
     if not message.text:
         return
 
+
     # игнорируем команды
     if message.text.startswith("/"):
         return
+
 
     # игнорируем ботов
     if (
@@ -664,35 +643,42 @@ async def collect(
     ):
         return
 
-    user_handle = message.from_user.username if message.from_user else None
-    user_fname = message.from_user.first_name if message.from_user else "Участник"
 
-    # Приоритет отдаем юзернейму, если его нет — имени
-    db_username = user_handle if user_handle else user_fname
+
+    username = (
+
+        message.from_user.first_name
+
+        if message.from_user
+        and message.from_user.first_name
+
+        else "Участник"
+
+    )
+
 
     try:
         await save_message(
-            db_username,
+            username,
             message.text
         )
 
+
         logging.info(
-            f"{db_username}: {message.text}"
+            f"{username}: {message.text}"
         )
 
-        # Проверка сообщений от пользователя @Akishinov (по юзернейму или имени)
-        is_akishinov = (user_handle and user_handle.lower() == "akishinov") or (
-            user_fname and user_fname.lower() == "akishinov"
-        )
-
-        if is_akishinov:
-            akishinov_msg_count += 1
-            if akishinov_msg_count >= 10:
-                akishinov_msg_count = 0
-                last_10_msgs = await get_user_last_messages(db_username, limit=10)
-                reproach = await generate_akishinov_reproach(last_10_msgs)
-                if reproach:
-                    await message.reply(f"🧙 <i>{html.escape(reproach)}</i>")
+        # Проверка сообщений от пользователя @Akishinov
+        if message.from_user:
+            user_handle = message.from_user.username
+            user_fname = message.from_user.first_name
+            if (user_handle and user_handle.lower() == "akishinov") or (user_fname and user_fname.lower() == "akishinov"):
+                akishinov_msg_count += 1
+                if akishinov_msg_count >= 10:
+                    akishinov_msg_count = 0
+                    reproach = await generate_akishinov_reproach(message.text)
+                    if reproach:
+                        await message.reply(f"🧙 <i>{html.escape(reproach)}</i>")
 
         # Случайный мудрый комментарий в разговор (шанс 1%, но не чаще 1 раза в 30 мин)
         now = datetime.now(TZ)
@@ -702,6 +688,7 @@ async def collect(
                 comment = await generate_random_remark(message.text)
                 if comment:
                     await message.reply(f"🧙 <i>{html.escape(comment)}</i>")
+
 
     except Exception as e:
         logging.error(
@@ -923,23 +910,12 @@ async def generate_random_remark(msg_text: str) -> str:
         return ""
 
 
-async def generate_akishinov_reproach(messages_list: list[str]) -> str:
-    """Строгий упрёк от Мудреца Мяумяура для Илья (@Akishinov) на основе анализа последних 10 его сообщений."""
-    formatted_messages = "\n".join([f"- {m}" for m in messages_list])
-    
+async def generate_akishinov_reproach(msg_text: str) -> str:
+    """Строгий упрёк от Мудреца Мяумяура для пользователя Илья (@Akishinov)."""
     prompt = f"""
-Ты — Мудрец Мяумяура. Пользователь Илья (ник @Akishinov) только что отправил 10 сообщений подряд в чат.
-
-Вот список последних 10 сообщений Ильи:
-{formatted_messages}
-
-Проанализируй тему, стиль или сам факт гиперактивности этих 10 сообщений.
-Жестко, емко и с мудрой иронией упрекни Илью (в духе "Ай-яй-яй, Илья, так писать нельзя...").
-Сделай акцент на том, О ЧЁМ он пишет в этих 10 сообщениях или как сильно флудит.
-
-Требования:
-- Длина: 1-3 предложения.
-- Полное отсутствие кошачьих слов, "мяу" и кошачьей атрибутики.
+Ты — Мудрец Мяумяура. Пользователь Илья (ник @Akishinov) написал уже 10 сообщений подряд в чате. Повод — его последнее сообщение: "{msg_text}".
+Жестко и с мудрой иронией упрекни Илью за гиперактивность или стиль написанного (в духе "Ай-яй-яй, Илья, так писать нельзя..."). 
+Длина — 1-3 предложения. Без кошачьих фраз и мяуканья.
 """
     try:
         response = await call_gemini_safe(
@@ -949,7 +925,7 @@ async def generate_akishinov_reproach(messages_list: list[str]) -> str:
         return response.text.strip()
     except Exception as e:
         logging.error(f"Ошибка генерации упрека: {e}")
-        return "Ай-яй-яй, Илья, целых 10 сообщений ни о чём! Пора бы и меру знать."
+        return "Ай-яй-яй, Илья, ну сколько можно писать? Пора и меру знать!"
 
 
 # =====================================================
@@ -1209,3 +1185,17 @@ async def main():
         if db_conn is not None:
 
             await db_conn.close()
+
+
+
+        await bot.session.close()
+
+
+
+# =====================================================
+# ENTRY POINT
+# =====================================================
+
+if __name__ == "__main__":
+
+    asyncio.run(main())
