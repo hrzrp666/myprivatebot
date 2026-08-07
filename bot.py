@@ -649,16 +649,13 @@ async def collect(
     if message.chat.id != CHAT_ID:
         return
 
-
     # только текст
     if not message.text:
         return
 
-
     # игнорируем команды
     if message.text.startswith("/"):
         return
-
 
     # игнорируем ботов
     if (
@@ -667,43 +664,35 @@ async def collect(
     ):
         return
 
+    user_handle = message.from_user.username if message.from_user else None
+    user_fname = message.from_user.first_name if message.from_user else "Участник"
 
-
-    username = (
-
-        message.from_user.first_name
-
-        if message.from_user
-        and message.from_user.first_name
-
-        else "Участник"
-
-    )
-
+    # Приоритет отдаем юзернейму, если его нет — имени
+    db_username = user_handle if user_handle else user_fname
 
     try:
         await save_message(
-            username,
+            db_username,
             message.text
         )
 
-
         logging.info(
-            f"{username}: {message.text}"
+            f"{db_username}: {message.text}"
         )
 
-        # Проверка сообщений от пользователя @Akishinov
-        if message.from_user:
-            user_handle = message.from_user.username
-            user_fname = message.from_user.first_name
-            if (user_handle and user_handle.lower() == "akishinov") or (user_fname and user_fname.lower() == "akishinov"):
-                akishinov_msg_count += 1
-                if akishinov_msg_count >= 10:
-                    akishinov_msg_count = 0
-                    last_10_msgs = await get_user_last_messages(username, limit=10)
-                    reproach = await generate_akishinov_reproach(last_10_msgs)
-                    if reproach:
-                        await message.reply(f"🧙 <i>{html.escape(reproach)}</i>")
+        # Проверка сообщений от пользователя @Akishinov (по юзернейму или имени)
+        is_akishinov = (user_handle and user_handle.lower() == "akishinov") or (
+            user_fname and user_fname.lower() == "akishinov"
+        )
+
+        if is_akishinov:
+            akishinov_msg_count += 1
+            if akishinov_msg_count >= 10:
+                akishinov_msg_count = 0
+                last_10_msgs = await get_user_last_messages(db_username, limit=10)
+                reproach = await generate_akishinov_reproach(last_10_msgs)
+                if reproach:
+                    await message.reply(f"🧙 <i>{html.escape(reproach)}</i>")
 
         # Случайный мудрый комментарий в разговор (шанс 1%, но не чаще 1 раза в 30 мин)
         now = datetime.now(TZ)
@@ -713,7 +702,6 @@ async def collect(
                 comment = await generate_random_remark(message.text)
                 if comment:
                     await message.reply(f"🧙 <i>{html.escape(comment)}</i>")
-
 
     except Exception as e:
         logging.error(
@@ -1221,17 +1209,3 @@ async def main():
         if db_conn is not None:
 
             await db_conn.close()
-
-
-
-        await bot.session.close()
-
-
-
-# =====================================================
-# ENTRY POINT
-# =====================================================
-
-if __name__ == "__main__":
-
-    asyncio.run(main())
