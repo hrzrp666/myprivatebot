@@ -109,10 +109,6 @@ TARGET_SERVICES = {
 }
 
 
-# Счётчик сообщений пользователя @Akishinov
-akishinov_msg_count = 0
-
-
 # =====================================================
 # INIT
 # =====================================================
@@ -619,7 +615,7 @@ async def plans_cmd(
 async def collect(
     message: types.Message
 ):
-    global last_random_comment_time, akishinov_msg_count
+    global last_random_comment_time
 
     # только нужный чат
     if message.chat.id != CHAT_ID:
@@ -667,18 +663,6 @@ async def collect(
         logging.info(
             f"{username}: {message.text}"
         )
-
-        # Проверка сообщений от пользователя @Akishinov
-        if message.from_user:
-            user_handle = message.from_user.username
-            user_fname = message.from_user.first_name
-            if (user_handle and user_handle.lower() == "akishinov") or (user_fname and user_fname.lower() == "akishinov"):
-                akishinov_msg_count += 1
-                if akishinov_msg_count >= 10:
-                    akishinov_msg_count = 0
-                    reproach = await generate_akishinov_reproach(message.text)
-                    if reproach:
-                        await message.reply(f"🧙 <i>{html.escape(reproach)}</i>")
 
         # Случайный мудрый комментарий в разговор (шанс 1%, но не чаще 1 раза в 30 мин)
         now = datetime.now(TZ)
@@ -908,24 +892,6 @@ async def generate_random_remark(msg_text: str) -> str:
         return response.text.strip()
     except Exception as e:
         return ""
-
-
-async def generate_akishinov_reproach(msg_text: str) -> str:
-    """Строгий упрёк от Мудреца Мяумяура для пользователя Илья (@Akishinov)."""
-    prompt = f"""
-Ты — Мудрец Мяумяура. Пользователь Илья (ник @Akishinov) написал уже 10 сообщений подряд в чате(Но не говори ему об этом). Повод — его последнее сообщение: "{msg_text}".
-Жестко и с мудрой иронией упрекни Илью. 
-Длина — 1-3 предложения. Без кошачьих фраз и мяуканья.
-"""
-    try:
-        response = await call_gemini_safe(
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(temperature=0.9)
-        )
-        return response.text.strip()
-    except Exception as e:
-        logging.error(f"Ошибка генерации упрека: {e}")
-        return "Ай-яй-яй, Илья, ну сколько можно писать? Пора и меру знать!"
 
 
 # =====================================================
