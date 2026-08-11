@@ -200,13 +200,26 @@ async def get_weather_day(lat: float, lon: float) -> dict:
         "🌆 Вечер": "нет данных"
     }
 
+    # Идентификация приложения снижает риск блокировки
+    headers = {"User-Agent": "WiseCatBot/1.0"}
+
     try:
         session = await get_http_session()
-        async with session.get(url, timeout=10) as resp:
-            if resp.status != 200:
-                logging.error(f"Open-Meteo error status ({lat}, {lon}): {resp.status}")
-                return fallback
-            data = await resp.json()
+        
+        # Делаем до 3 попыток при сбоях сети или статусе 429
+        for attempt in range(3):
+            async with session.get(url, headers=headers, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    break
+                elif resp.status == 429:
+                    logging.warning(f"Open-Meteo 429 (лимит). Ждем {(attempt + 1) * 2} сек...")
+                    await asyncio.sleep((attempt + 1) * 2)
+                else:
+                    logging.error(f"Open-Meteo error status ({lat}, {lon}): {resp.status}")
+                    return fallback
+        else:
+            return fallback
 
         hourly = data.get("hourly", {})
         times = hourly.get("time", [])
@@ -229,7 +242,6 @@ async def get_weather_day(lat: float, lon: float) -> dict:
         for title, hour in target_hours.items():
             expected_pattern = f"{today_str}T{hour:02d}:00"
             
-            # Ищем индекс нужного часа
             idx = next((i for i, t in enumerate(times) if expected_pattern in t), None)
 
             if idx is not None and idx < len(temps) and temps[idx] is not None:
