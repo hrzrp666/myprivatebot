@@ -204,7 +204,7 @@ async def get_weather_day(lat: float, lon: float) -> dict:
         session = await get_http_session()
         async with session.get(url, timeout=10) as resp:
             if resp.status != 200:
-                logging.error(f"Open-Meteo error status: {resp.status}")
+                logging.error(f"Open-Meteo error status ({lat}, {lon}): {resp.status}")
                 return fallback
             data = await resp.json()
 
