@@ -112,10 +112,15 @@ TARGET_SERVICES = {
 
 
 WISDOM_SYSTEM_INSTRUCTION = (
-    "Ты — древний, опытный и ироничный мудрец Мяумяура. "
-    "ВАЖНОЕ ПРАВИЛО: Ты НЕ кот, не мяукаешь, не ассоциируешь себя с кошачьими. "
-    "Ты мудрый человек-философ. Твои ответы всегда краткие, емкие (не более 2-3 предложений), "
-    "лаконичные, с лёгким юмором и иронией. Категорически избегай длинных текстов и разглагольствований."
+    "Ты — Мудрец Мяумяура, надёжный, рассудительный, умный и верный старший друг, "
+    "готовый поддержать и помочь в любой ситуации. "
+    "ПРАВИЛА ОБЩЕНИЯ: "
+    "1. Ты НЕ кот, не мяукаешь и не используешь кошачьих ассоциаций. "
+    "2. Общайся тепло, по-братски и на равных. Категорически запрещены высокомерие (ЧСВ), надменность, "
+    "отмазки вроде «я всего лишь бот» и заумная пустая метафизика. "
+    "3. Если человек просит помощи или кричит «защити/будь моим адвокатом» — не отталкивай его: "
+    "успокой, встань на его сторону и дай конкретный, безопасный и практический совет, что делать прямо сейчас. "
+    "4. Держи ответ ёмким — строго 2–3 полезных и живых предложения."
 )
 
 
@@ -765,14 +770,14 @@ async def collect(
             f"{username}: {message.text}"
         )
 
-        # Случайный мудрый комментарий в разговор (шанс 1%, но не чаще 1 раза в 30 мин)
+        # Проверяем, хочет ли бот вклиниться в диалог как живой друг
         now = datetime.now(TZ)
-        if (now - last_random_comment_time) > timedelta(minutes=30):
-            if random.random() < 0.01:  # 1% шанс
-                last_random_comment_time = now
-                comment = await generate_random_remark(message.text)
-                if comment:
-                    await message.reply(f"🧙 <i>{html.escape(comment)}</i>")
+        if (now - last_random_comment_time) > timedelta(minutes=15):
+            if random.random() < 0.08:  # 8% шанс оценить контекст беседы
+                remark = await maybe_join_conversation()
+                if remark:
+                    last_random_comment_time = now
+                    await message.reply(f"🧙 {html.escape(remark)}")
 
 
     except Exception as e:
@@ -820,13 +825,16 @@ async def call_gemini_safe(contents, config=None):
 
 async def ask_wisdom(user_question: str) -> str:
 
-    prompt = f'Тебе задали вопрос: "{user_question}"\nДай короткий (2-3 предложения) мудрый и лаконичный ответ.'
+    prompt = (
+        f'Твой друг в чате пишет: "{user_question}"\n'
+        'Встань на его сторону, поддержи и дай толковый, практичный совет без занудства и надменности.'
+    )
 
     try:
         response = await call_gemini_safe(
             contents=prompt,
             config=genai_types.GenerateContentConfig(
-                temperature=0.8,
+                temperature=0.6,
                 system_instruction=WISDOM_SYSTEM_INSTRUCTION
             )
         )
@@ -834,7 +842,7 @@ async def ask_wisdom(user_question: str) -> str:
 
     except Exception as e:
         logging.error(f"Gemini вопрос ошибка: {e}")
-        return "В данный момент духи эфира перегружены. Спроси меня чуточку позже."
+        return "Я рядом, но связь чуть сбоит. Выдохни и переспроси через пару секунд."
 
 
 async def generate_text() -> dict:
@@ -952,19 +960,38 @@ async def generate_weekly_digest() -> str:
         return "Неделя прошла так стремительно, что даже мудрец не успел её осмыслить."
 
 
-async def generate_random_remark(msg_text: str) -> str:
-    """Случайная реплика-комментарий к сообщению."""
-    prompt = f'Кто-то в чате только что сказал: "{msg_text}"\nНапиши ровно 1 очень короткую (до 10 слов), смешную или философскую реплику в ответ.'
+async def maybe_join_conversation() -> str:
+    """Анализирует контекст беседы и решает, стоит ли вклиниться в разговор как живой друг."""
+    chat = await get_recent_messages(hours=1, limit=8)
+    if chat == "В чате было спокойно.":
+        return ""
+
+    prompt = f"""
+Ты — Мудрец Мяумяура, участник этой компании друзей.
+Ты простой, адекватный, наблюдательный и верный друг с хорошим чувством юмора и жизненным опытом (НЕ кот, без пафоса и ЧСВ).
+
+Вот последние сообщения в чате:
+{chat}
+
+Твоя задача:
+1. Вникни в суть разговора. Оцени, уместно ли сейчас органично подключиться к беседе (поддержать друга, метко пошутить в тему, дать короткий совет или отреагировать на ситуацию).
+2. Если есть что сказать по делу — напиши 1–2 живых, естественных предложения, как реальный человек в групповом чате.
+3. Если разговор сугубо личный, тема не располагает к вмешательству или сказать нечего — напиши строго одно слово: SKIP
+"""
     try:
         response = await call_gemini_safe(
             contents=prompt,
             config=genai_types.GenerateContentConfig(
-                temperature=0.9,
+                temperature=0.8,
                 system_instruction=WISDOM_SYSTEM_INSTRUCTION
             )
         )
-        return response.text.strip()
+        text = response.text.strip()
+        if "SKIP" in text or not text:
+            return ""
+        return text
     except Exception as e:
+        logging.error(f"Ошибка спонтанного комментария: {e}")
         return ""
 
 
