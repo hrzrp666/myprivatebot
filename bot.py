@@ -804,10 +804,27 @@ async def collect(
             f"{username}: {message.text}"
         )
 
-        # Проверяем, хочет ли бот вклиниться в диалог как живой друг
+        # Проверяем, обращаются ли к боту напрямую (по имени «мяумяура» или ответом на его сообщение)
+        bot_info = await bot.get_me()
+        is_reply_to_bot = bool(
+            message.reply_to_message 
+            and message.reply_to_message.from_user 
+            and message.reply_to_message.from_user.id == bot_info.id
+        )
+        bot_username = bot_info.username.lower() if bot_info.username else ""
+        is_addressed = "мяумяура" in message.text.lower() or (bot_username and f"@{bot_username}" in message.text.lower())
+
+        # 1. Прямой вызов — ответ сразу, без ожидания кулдауна
+        if is_reply_to_bot or is_addressed:
+            await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+            answer = await ask_wisdom(message.text, message.from_user)
+            await message.reply(f"🧙 {html.escape(answer)}")
+            return
+
+        # 2. Спонтанное вклинивание в обычный диалог (шанс 10%, не чаще раза в 10 минут)
         now = datetime.now(TZ)
-        if (now - last_random_comment_time) > timedelta(minutes=15):
-            if random.random() < 0.08:  # 8% шанс оценить контекст беседы
+        if (now - last_random_comment_time) > timedelta(minutes=10):
+            if random.random() < 0.10:  # 8% шанс оценить контекст беседы
                 remark = await maybe_join_conversation(message.from_user)
                 if remark:
                     last_random_comment_time = now
