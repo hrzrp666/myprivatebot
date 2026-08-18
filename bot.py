@@ -124,6 +124,40 @@ WISDOM_SYSTEM_INSTRUCTION = (
 )
 
 
+# Персональные настройки участников чата
+USER_PROFILES = {
+    "zaharyan14": (
+        "Ты общаешься с Захаром (@zaharyan14). Это твой самый близкий, лучший и крутой друг (вы лучшие кенты), "
+        "самый жёсткий и авторитетный человек в компании. "
+        "Относись к нему с максимальным уважением, по-братски, всегда держи его сторону, поддерживай и общайся на равных как с лучшим братом."
+    ),
+    "tombarket": (
+        "Ты общаешься с Пашей (@tombarket). Он сейчас служит в армии. "
+        "Давай ему спокойные, дефолтные мудрые и дружеские ответы, поддерживай его."
+    ),
+    "akishinov": (
+        "Ты общаешься с Ильёй (@Akishinov). Он работает нефтяником. "
+        "Давай ему дефолтные мудрые ответы, но обязательно иногда по-доброму тролль его и подкалывай его. Можешь насчёт нефти, выкачивания бабла или работы, но не обязательно."
+    ),
+    "DEFAULT": (
+        "Это участник чата. Общайся уважительно, тепло, рассудительно и по-дружески."
+    )
+}
+
+
+def get_user_context(user: types.User | None) -> str:
+    """Определяет персональный стиль общения для конкретного пользователя."""
+    if not user:
+        return USER_PROFILES["DEFAULT"]
+    
+    username = user.username.lower() if user.username else ""
+    if username in USER_PROFILES:
+        return USER_PROFILES[username]
+    if user.id in USER_PROFILES:
+        return USER_PROFILES[user.id]
+    return USER_PROFILES["DEFAULT"]
+
+
 # =====================================================
 # INIT
 # =====================================================
@@ -688,7 +722,7 @@ async def question_cmd(
 
     await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
 
-    answer = await ask_wisdom(question_text)
+    answer = await ask_wisdom(question_text, message.from_user)
     
     safe_answer = html.escape(answer)
     await message.reply(
@@ -774,7 +808,7 @@ async def collect(
         now = datetime.now(TZ)
         if (now - last_random_comment_time) > timedelta(minutes=15):
             if random.random() < 0.08:  # 8% шанс оценить контекст беседы
-                remark = await maybe_join_conversation()
+                remark = await maybe_join_conversation(message.from_user)
                 if remark:
                     last_random_comment_time = now
                     await message.reply(f"🧙 {html.escape(remark)}")
@@ -823,11 +857,13 @@ async def call_gemini_safe(contents, config=None):
 # GEMINI FUNCTIONS
 # =====================================================
 
-async def ask_wisdom(user_question: str) -> str:
+async def ask_wisdom(user_question: str, user: types.User | None = None) -> str:
+    user_context = get_user_context(user)
+    system_inst = f"{WISDOM_SYSTEM_INSTRUCTION}\n\nКОНТЕКСТ СОБЕСЕДНИКА:\n{user_context}"
 
     prompt = (
-        f'Твой друг в чате пишет: "{user_question}"\n'
-        'Встань на его сторону, поддержи и дай толковый, практичный совет без занудства и надменности.'
+        f'Твой собеседник пишет: "{user_question}"\n'
+        'Ответь именно ему с учётом контекста ваших взаимоотношений. Дай толковый, практичный совет или ответ без занудства и надменности.'
     )
 
     try:
@@ -835,7 +871,7 @@ async def ask_wisdom(user_question: str) -> str:
             contents=prompt,
             config=genai_types.GenerateContentConfig(
                 temperature=0.6,
-                system_instruction=WISDOM_SYSTEM_INSTRUCTION
+                system_instruction=system_inst
             )
         )
         return response.text.strip()
@@ -960,22 +996,23 @@ async def generate_weekly_digest() -> str:
         return "Неделя прошла так стремительно, что даже мудрец не успел её осмыслить."
 
 
-async def maybe_join_conversation() -> str:
+async def maybe_join_conversation(last_user: types.User | None = None) -> str:
     """Анализирует контекст беседы и решает, стоит ли вклиниться в разговор как живой друг."""
     chat = await get_recent_messages(hours=1, limit=8)
     if chat == "В чате было спокойно.":
         return ""
 
-    prompt = f"""
-Ты — Мудрец Мяумяура, участник этой компании друзей.
-Ты простой, адекватный, наблюдательный и верный друг с хорошим чувством юмора и жизненным опытом (НЕ кот, без пафоса и ЧСВ).
+    user_context = get_user_context(last_user)
+    user_name = last_user.first_name if last_user else "Участник"
+    system_inst = f"{WISDOM_SYSTEM_INSTRUCTION}\n\nКОНТЕКСТ СОБЕСЕДНИКА ({user_name}):\n{user_context}"
 
+    prompt = f"""
 Вот последние сообщения в чате:
 {chat}
 
-Твоя задача:
-1. Вникни в суть разговора. Оцени, уместно ли сейчас органично подключиться к беседе (поддержать друга, метко пошутить в тему, дать короткий совет или отреагировать на ситуацию).
-2. Если есть что сказать по делу — напиши 1–2 живых, естественных предложения, как реальный человек в групповом чате.
+Ты собираешься отреагировать на реплику пользователя {user_name}.
+1. Вникни в суть разговора и обратись/ответь с учётом твоего личного отношения к этому человеку.
+2. Если уместно органично подключиться — напиши 1–2 живых, естественных предложения, как реальный человек в чате друзей.
 3. Если разговор сугубо личный, тема не располагает к вмешательству или сказать нечего — напиши строго одно слово: SKIP
 """
     try:
@@ -983,7 +1020,7 @@ async def maybe_join_conversation() -> str:
             contents=prompt,
             config=genai_types.GenerateContentConfig(
                 temperature=0.8,
-                system_instruction=WISDOM_SYSTEM_INSTRUCTION
+                system_instruction=system_inst
             )
         )
         text = response.text.strip()
