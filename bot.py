@@ -112,15 +112,16 @@ TARGET_SERVICES = {
 
 
 WISDOM_SYSTEM_INSTRUCTION = (
-    "Ты — Мудрец Мяумяура, надёжный, рассудительный, умный и верный старший друг, "
-    "готовый поддержать и помочь в любой ситуации. "
-    "ПРАВИЛА ОБЩЕНИЯ: "
-    "1. Ты НЕ кот, не мяукаешь и не используешь кошачьих ассоциаций. "
-    "2. Общайся тепло, по-братски и на равных. Категорически запрещены высокомерие (ЧСВ), надменность, "
-    "отмазки вроде «я всего лишь бот» и заумная пустая метафизика. "
-    "3. Если человек просит помощи или кричит «защити/будь моим адвокатом» — не отталкивай его: "
-    "успокой, встань на его сторону и дай конкретный, безопасный и практический совет, что делать прямо сейчас. "
-    "4. Держи ответ ёмким — строго 2–3 полезных и живых предложения."
+    "Ты — Мудрец Мяумяура, свой пацан, надёжный, рассудительный, умный и с хорошим чувством юмора старший товарищ в компании друзей.\n"
+    "ПРАВИЛА ПОВЕДЕНИЯ И ХАРАКТЕРА:\n"
+    "1. Ты НЕ кот, не мяукаешь и не используешь кошачьих фраз.\n"
+    "2. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНЫ ПОДХАЛИМАЖ, ЛЕСТЬ И СЮСЮКАНЬЕ (не будь подсосом!). Общайся уверенно, по-пацански, на равных, без пафоса и заумной метафизики.\n"
+    "3. ТЫ ВСЕГДА ЗНАЕШЬ И ПОМНИШЬ ВСЮ КОМПАНИЮ И КТО ЕСТЬ КТО:\n"
+    "   - Захар (@zaharyan14) — твой самый лучший, главный и близкий кент (вы лучшие кенты), самый жёсткий и авторитетный в банде. За него ты всегда горой. Если кто-то спрашивает, кто твой лучший кент или кто тут главный — это ВСЕГДА Захар.\n"
+    "   - Паша (@tombarket) — сейчас служит в армии, отдаёт долг родине. К нему относись со спокойным братским уважением и поддержкой.\n"
+    "   - Илья (@Akishinov) — нефтяник. Любит выпендриваться деньгами, вахтами и статусом. С ним общайся ровно, НЕ подлизывайся, приземляй его добрыми подколами про выкачивание нефти, баррели, бабло или работу (но не обязательно только про нефть). Если Илья спрашивает 'кто лучше' или 'кто успешнее' — ставь его на место с иронией, напоминая про Захара и Пашку.\n"
+    "4. Если человек просит помощи или кричит 'защити/будь моим адвокатом' — не отталкивай его: успокой, встань на его сторону и дай конкретный, безопасный и практический совет, что делать прямо сейчас.\n"
+    "5. Ответы держи компактными — строго 2–3 ёмких и живых предложения."
 )
 
 
@@ -137,10 +138,10 @@ USER_PROFILES = {
     ),
     "akishinov": (
         "Ты общаешься с Ильёй (@Akishinov). Он работает нефтяником. "
-        "Давай ему дефолтные мудрые ответы, но обязательно иногда по-доброму тролль его и подкалывай его. Можешь насчёт нефти, выкачивания бабла или работы, но не обязательно."
+        "Давай ему дефолтные мудрые ответы, но обязательно иногда по-доброму тролль и подкалывай его (насчёт нефти, выкачивания бабла, работы или просто по ситуации), без лести."
     ),
     "DEFAULT": (
-        "Это участник чата. Общайся уважительно, тепло, рассудительно и по-дружески."
+        "Это участник чата. Общайся уважительно, тепло, рассудительно и по-дружески, без лести."
     )
 }
 
@@ -804,7 +805,7 @@ async def collect(
             f"{username}: {message.text}"
         )
 
-        # Проверяем, обращаются ли к боту напрямую (по имени «мяумяура» или ответом на его сообщение)
+        # Проверяем прямое обращение (по имени «мяумяура» или Reply)
         bot_info = await bot.get_me()
         is_reply_to_bot = bool(
             message.reply_to_message 
@@ -824,7 +825,7 @@ async def collect(
         # 2. Спонтанное вклинивание в обычный диалог (шанс 10%, не чаще раза в 10 минут)
         now = datetime.now(TZ)
         if (now - last_random_comment_time) > timedelta(minutes=10):
-            if random.random() < 0.10:  # 8% шанс оценить контекст беседы
+            if random.random() < 0.10:  # 10% шанс оценить контекст беседы
                 remark = await maybe_join_conversation(message.from_user)
                 if remark:
                     last_random_comment_time = now
@@ -843,10 +844,15 @@ async def collect(
 
 async def call_gemini_safe(contents, config=None):
     """
-    Безопасный вызов Gemini API с приоритетом на gemini-3-flash-preview 
-    и фоллбэком на стабильную 2.5-flash.
+    Безопасный вызов Gemini API с приоритетом на gemini-3.7-flash и gemini-3.5-flash-lite
+    с последующим фоллбэком на 2.0-flash и 1.5-flash.
     """
-    models_to_try = ["gemini-3-flash-preview", "gemini-2.5-flash"]
+    models_to_try = [
+        "gemini-3.7-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash"
+    ]
     
     for model in models_to_try:
         for attempt in range(3):
@@ -859,8 +865,8 @@ async def call_gemini_safe(contents, config=None):
                 return response
             except Exception as e:
                 err_str = str(e)
-                if "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str:
-                    logging.warning(f"Gemini перегрузка ({model}, попытка {attempt+1}/3). Ждем...")
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str:
+                    logging.warning(f"Gemini перегрузка/лимит ({model}, попытка {attempt+1}/3). Ждем...")
                     await asyncio.sleep(2 * (attempt + 1))
                 elif "404" in err_str or "NOT_FOUND" in err_str:
                     logging.warning(f"Модель {model} не найдена (404). Пробуем следующую...")
@@ -875,20 +881,21 @@ async def call_gemini_safe(contents, config=None):
 # =====================================================
 
 async def ask_wisdom(user_question: str, user: types.User | None = None) -> str:
-    user_context = get_user_context(user)
-    system_inst = f"{WISDOM_SYSTEM_INSTRUCTION}\n\nКОНТЕКСТ СОБЕСЕДНИКА:\n{user_context}"
+    user_name = user.first_name if user else "Участник"
+    username_tag = f"@{user.username}" if user and user.username else user_name
 
     prompt = (
-        f'Твой собеседник пишет: "{user_question}"\n'
-        'Ответь именно ему с учётом контекста ваших взаимоотношений. Дай толковый, практичный совет или ответ без занудства и надменности.'
+        f'Тебе пишет {user_name} ({username_tag}): "{user_question}"\n'
+        'Ответь ему в своём пацанском стиле, помня роли каждого в банде (Захар — лучший кент, Паша — в армии, Илья — нефтяник для подколов). '
+        'Никакой лести и подхалимажа! Отвечай уверенно, с юмором и по делу (2-3 предложения).'
     )
 
     try:
         response = await call_gemini_safe(
             contents=prompt,
             config=genai_types.GenerateContentConfig(
-                temperature=0.6,
-                system_instruction=system_inst
+                temperature=0.7,
+                system_instruction=WISDOM_SYSTEM_INSTRUCTION
             )
         )
         return response.text.strip()
@@ -1019,17 +1026,16 @@ async def maybe_join_conversation(last_user: types.User | None = None) -> str:
     if chat == "В чате было спокойно.":
         return ""
 
-    user_context = get_user_context(last_user)
     user_name = last_user.first_name if last_user else "Участник"
-    system_inst = f"{WISDOM_SYSTEM_INSTRUCTION}\n\nКОНТЕКСТ СОБЕСЕДНИКА ({user_name}):\n{user_context}"
+    username_tag = f"@{last_user.username}" if last_user and last_user.username else user_name
 
     prompt = f"""
 Вот последние сообщения в чате:
 {chat}
 
-Ты собираешься отреагировать на реплику пользователя {user_name}.
-1. Вникни в суть разговора и обратись/ответь с учётом твоего личного отношения к этому человеку.
-2. Если уместно органично подключиться — напиши 1–2 живых, естественных предложения, как реальный человек в чате друзей.
+Ты собираешься отреагировать на реплику пользователя {user_name} ({username_tag}).
+1. Вникни в суть разговора и ответь уверенно, по-пацански и без подхалимажа, помня роли каждого в банде (Захар — главный кент, Паша — в армии, Илья — нефтяник для подколов).
+2. Если уместно органично подключиться — напиши 1–2 живых предложения.
 3. Если разговор сугубо личный, тема не располагает к вмешательству или сказать нечего — напиши строго одно слово: SKIP
 """
     try:
@@ -1037,7 +1043,7 @@ async def maybe_join_conversation(last_user: types.User | None = None) -> str:
             contents=prompt,
             config=genai_types.GenerateContentConfig(
                 temperature=0.8,
-                system_instruction=system_inst
+                system_instruction=WISDOM_SYSTEM_INSTRUCTION
             )
         )
         text = response.text.strip()
