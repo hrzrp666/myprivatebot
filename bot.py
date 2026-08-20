@@ -769,18 +769,14 @@ def encode_army_sea_state(wind_speed_ms: float) -> tuple[str, str]:
 
 async def fetch_svyatoy_nos_army_weather() -> dict:
     """
-    Получает погоду с защитой от 429:
-    1. Кэш в памяти (10 минут).
-    2. Open-Meteo.
-    3. Резервный источник wttr.in.
-    4. Предыдущее известное состояние или дефолт.
+    Получает реальную погоду с защитой от 429 и правильным парсингом резервных источников.
     """
     cached = get_cached_weather("svyatoy_nos_army")
     if cached:
         return cached
 
     session = await get_http_session()
-    headers = {"User-Agent": "TelegramArmyWeatherBot/2.0 (Mozilla/5.0)"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) TelegramArmyBot/2.0"}
 
     # 1. Попытка Open-Meteo
     url_om = (
@@ -795,7 +791,7 @@ async def fetch_svyatoy_nos_army_weather() -> dict:
     try:
         async with session.get(url_om, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
             if resp.status == 200:
-                data = await resp.json()
+                data = await resp.json(content_type=None)
                 current = data.get("current", {})
                 hourly = data.get("hourly", {})
                 vis_list = hourly.get("visibility", [])
@@ -803,25 +799,25 @@ async def fetch_svyatoy_nos_army_weather() -> dict:
                 set_cached_weather("svyatoy_nos_army", current)
                 return current
             else:
-                logging.warning(f"Open-Meteo вернул {resp.status}. Переключаюсь на резервный источник...")
+                logging.warning(f"Open-Meteo вернул {resp.status}. Переключаюсь на wttr.in...")
     except Exception as e:
-        logging.warning(f"Open-Meteo недоступен ({e}). Переключаюсь на резерв...")
+        logging.warning(f"Open-Meteo недоступен ({e}). Переключаюсь на wttr.in...")
 
-    # 2. Резервная попытка через wttr.in (не подвержен лимитам Open-Meteo)
+    # 2. Резервный источник wttr.in (с отключенной строгой проверкой mimetype)
     url_wttr = f"https://wttr.in/{SVYATOY_NOS_LAT},{SVYATOY_NOS_LON}?format=j1"
     try:
-        async with session.get(url_wttr, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+        async with session.get(url_wttr, headers=headers, timeout=aiohttp.ClientTimeout(total=6)) as resp:
             if resp.status == 200:
-                data = await resp.json()
+                data = await resp.json(content_type=None)
                 cur = data.get("current_condition", [{}])[0]
-                temp = float(cur.get("temp_C", 10))
+                temp = float(cur.get("temp_C", 5))
                 wind_kmh = float(cur.get("windspeedKmph", 15))
                 wind_ms = wind_kmh / 3.6
-                wind_dir = float(cur.get("winddirDegree", 90))
-                vis_km = float(cur.get("visibility", 16))
+                wind_dir = float(cur.get("winddirDegree", 0))
+                vis_km = float(cur.get("visibility", 10))
                 w_desc_code = cur.get("weatherCode", "113")
                 
-                # Конвертация кодов WWO в Open-Meteo формат
+                # Конвертация кодов погоды
                 w_code = 0
                 wc = int(w_desc_code) if str(w_desc_code).isdigit() else 113
                 if wc in [386, 389, 392, 395]:
@@ -846,7 +842,10 @@ async def fetch_svyatoy_nos_army_weather() -> dict:
                     "visibility": vis_km * 1000
                 }
                 set_cached_weather("svyatoy_nos_army", parsed)
+                logging.info("Погода для Пахи успешно получена через резервный wttr.in")
                 return parsed
+            else:
+                logging.warning(f"wttr.in вернул {resp.status}")
     except Exception as e:
         logging.warning(f"wttr.in ошибка: {e}")
 
@@ -855,12 +854,12 @@ async def fetch_svyatoy_nos_army_weather() -> dict:
     if last_known:
         return last_known
 
-    # 4. Аварийный дефолт (Святой Нос, Баренцево море)
+    # 4. Аварийный дефолт
     return {
-        "temperature_2m": 8.0,
-        "wind_speed_10m": 5.0,
+        "temperature_2m": 5.0,
+        "wind_speed_10m": 4.0,
         "wind_direction_10m": 90.0,
-        "wind_gusts_10m": 7.0,
+        "wind_gusts_10m": 6.0,
         "weather_code": 3,
         "visibility": 18000
     }
