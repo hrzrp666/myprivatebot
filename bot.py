@@ -83,6 +83,7 @@ WEATHER_CODES = {
 
 # Иркутское время
 TZ = ZoneInfo("Asia/Irkutsk")
+TZ_MSK = ZoneInfo("Europe/Moscow")
 
 
 logging.basicConfig(
@@ -866,6 +867,41 @@ async def fetch_svyatoy_nos_army_weather() -> dict:
     }
 
 
+def build_army_code_string(current: dict) -> str:
+    """Генерирует 10-значный шифр по метеоданным."""
+    w_code = current.get("weather_code", 0)
+    w_dir_deg = current.get("wind_direction_10m", 0)
+    w_spd_ms = round(current.get("wind_speed_10m", 0))
+    w_gusts_ms = round(current.get("wind_gusts_10m", 0))
+    temp = round(current.get("temperature_2m", 10))
+    vis_m = current.get("visibility", 20000)
+
+    ph_code, _ = encode_army_phenomenon(w_code, w_gusts_ms)
+    wdir_code, _ = encode_army_wind_dir(w_dir_deg)
+    wspd_code = f"{max(0, min(99, w_spd_ms)):02d}"
+    vis_code, _ = encode_army_visibility(vis_m)
+    temp_code = f"{abs(temp):02d}"
+
+    # Если видимость <= 3 (5 каб и меньше), море не видно -> "XX"
+    if int(vis_code) <= 3:
+        sea_code = "XX"
+    else:
+        sea_code, _ = encode_army_sea_state(w_spd_ms)
+
+    return f"{ph_code}{wdir_code}{wspd_code}{vis_code}{temp_code}{sea_code}"
+
+
+async def send_auto_army_weather():
+    """Автоматическая отправка 1-строчной сводки для дежурства Пахи каждые 2 часа (20:00–08:00 МСК)."""
+    try:
+        current = await fetch_svyatoy_nos_army_weather()
+        full_code = build_army_code_string(current)
+        await bot.send_message(CHAT_ID, f"Погода Святой Нос: <code>{full_code}</code>")
+        logging.info(f"Авто-сводка для Пахи отправлена: {full_code}")
+    except Exception as e:
+        logging.error(f"Ошибка отправки авто-сводки для Пахи: {e}")
+
+
 # =====================================================
 # COMMANDS
 # =====================================================
@@ -879,7 +915,7 @@ async def start(
         "🧙 Мудрец Мяумяура запущен.\n\n"
         "📜 <b>Мои возможности:</b>\n"
         "• Каждое утро в 09:00 — Мысль дня и погода\n"
-        "• /code или /паха — Армейский шифр погоды на Святом Носе\n"
+        "• /code или /паха — Сводка (шифр) для Пахи на Святом Носе\n"
         "• /question &lt;вопрос&gt; — Спросить мудреца\n"
         "• /summary — Краткая выжимка (что пропустили в чате)\n"
         "• Каждое воскресенье в 20:00 — Итоги недели"
@@ -910,47 +946,13 @@ async def test(
 
 @dp.message(Command("code", "paha", "svodka", "погода", "сводка", "код", "паха"))
 async def army_weather_cmd(message: types.Message):
-    """Генератор армейского 10-значного кода для вахты Пахи на Святом Носе."""
+    """Генератор армейского кода для вахты Пахи на Святом Носе."""
     await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
 
     current = await fetch_svyatoy_nos_army_weather()
+    full_code = build_army_code_string(current)
 
-    w_code = current.get("weather_code", 0)
-    w_dir_deg = current.get("wind_direction_10m", 0)
-    w_spd_ms = round(current.get("wind_speed_10m", 0))
-    w_gusts_ms = round(current.get("wind_gusts_10m", 0))
-    temp = round(current.get("temperature_2m", 10))
-    vis_m = current.get("visibility", 20000)
-
-    ph_code, ph_text = encode_army_phenomenon(w_code, w_gusts_ms)
-    wdir_code, wdir_text = encode_army_wind_dir(w_dir_deg)
-    wspd_code = f"{max(0, min(99, w_spd_ms)):02d}"
-    vis_code, vis_text = encode_army_visibility(vis_m)
-    temp_code = f"{abs(temp):02d}"
-
-    # Армейское правило: если видимость <= 3 (5 каб и меньше), море не видно -> "XX"
-    if int(vis_code) <= 3:
-        sea_code = "XX"
-        sea_text = "XX (море не просматривается из-за видимости)"
-    else:
-        sea_code, sea_text = encode_army_sea_state(w_spd_ms)
-
-    full_code = f"{ph_code}{wdir_code}{wspd_code}{vis_code}{temp_code}{sea_code}"
-
-    response = (
-        f"🫡 <b>Метеосводка для Пахи (мыс Святой Нос):</b>\n\n"
-        f"📟 Готовый код: <code>{full_code}</code>\n\n"
-        f"<b>Расшифровка:</b>\n"
-        f"• <b>Явление [{ph_code}]:</b> {ph_text}\n"
-        f"• <b>Ветер [{wdir_code}]:</b> {wdir_text}\n"
-        f"• <b>Скорость [{wspd_code}]:</b> {w_spd_ms} м/с\n"
-        f"• <b>Видимость [{vis_code}]:</b> {vis_text}\n"
-        f"• <b>Температура [{temp_code}]:</b> {temp}°C\n"
-        f"• <b>Море [{sea_code}]:</b> {sea_text}\n\n"
-        f"<i>Служи спокойно, Паша, Мудрец всё посчитал!</i>"
-    )
-
-    await message.reply(response)
+    await message.reply(f"Погода Святой Нос: <code>{full_code}</code>")
 
 
 @dp.message(Command("question"))
@@ -1486,12 +1488,26 @@ def setup_scheduler():
     )
 
 
+    # Авто-сводка для Пахи: с 20:00 до 08:00 по МСК каждые 2 часа в :00
+    scheduler.add_job(
+        send_auto_army_weather,
+        "cron",
+        hour="0,2,4,6,8,20,22",
+        minute=0,
+        timezone=TZ_MSK,
+        id="army_weather_paha",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True
+    )
+
+
 
     scheduler.start()
 
 
     logging.info(
-        "Планировщик запущен: Иркутск 09:00 (daily), Вс 20:00 (weekly), Uptime (5м), Storm (30м)"
+        "Планировщик запущен: Иркутск 09:00 (daily), Вс 20:00 (weekly), МСК 20:00-08:00 (Паха каждые 2ч)"
     )
 
 
