@@ -5,6 +5,7 @@ import os
 import json
 import html
 import random
+import time
 import aiohttp
 
 from datetime import datetime, timedelta
@@ -209,6 +210,28 @@ last_random_comment_time = datetime.min.replace(tzinfo=TZ)
 web_runner = None
 
 
+# Кэш метеоданных для защиты от лимитов (429)
+WEATHER_CACHE = {}
+
+
+def get_cached_weather(key: str, max_age_seconds: int = 600) -> dict | None:
+    if key in WEATHER_CACHE:
+        val, ts = WEATHER_CACHE[key]
+        if time.time() - ts < max_age_seconds:
+            return val
+    return None
+
+
+def set_cached_weather(key: str, val: dict):
+    WEATHER_CACHE[key] = (val, time.time())
+
+
+def get_last_known_weather(key: str) -> dict | None:
+    if key in WEATHER_CACHE:
+        return WEATHER_CACHE[key][0]
+    return None
+
+
 async def get_http_session() -> aiohttp.ClientSession:
     global http_session
     if http_session is None or http_session.closed:
@@ -244,7 +267,7 @@ async def get_weather_day(lat: float, lon: float) -> dict:
         "🌆 Вечер": "нет данных"
     }
 
-    headers = {"User-Agent": "WiseCatBot/1.0"}
+    headers = {"User-Agent": "TelegramWeatherBot/2.0 (Mozilla/5.0)"}
 
     try:
         session = await get_http_session()
@@ -316,6 +339,7 @@ async def check_storm_warnings():
     
     alerts = []
     session = await get_http_session()
+    headers = {"User-Agent": "TelegramStormBot/2.0 (Mozilla/5.0)"}
     
     for name, lat, lon in locations:
         url = (
@@ -325,7 +349,7 @@ async def check_storm_warnings():
             f"&timezone=Asia%2FIrkutsk"
         )
         try:
-            async with session.get(url, timeout=10) as resp:
+            async with session.get(url, headers=headers, timeout=10) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     current = data.get("current", {})
@@ -570,7 +594,6 @@ async def get_weekly_sampled_messages() -> str:
     result_lines = []
     for day_key, msgs in daily_messages.items():
         result_lines.append(f"--- Дата: {day_key} ---")
-        # Берем равномерную выборку из сообщений за день
         step = max(1, len(msgs) // 20)
         sampled = msgs[::step][:20]
         result_lines.extend(sampled)
@@ -744,8 +767,23 @@ def encode_army_sea_state(wind_speed_ms: float) -> tuple[str, str]:
         return "90", "9 баллов"
 
 
-async def fetch_svyatoy_nos_army_weather() -> dict | None:
-    url = (
+async def fetch_svyatoy_nos_army_weather() -> dict:
+    """
+    Получает погоду с защитой от 429:
+    1. Кэш в памяти (10 минут).
+    2. Open-Meteo.
+    3. Резервный источник wttr.in.
+    4. Предыдущее известное состояние или дефолт.
+    """
+    cached = get_cached_weather("svyatoy_nos_army")
+    if cached:
+        return cached
+
+    session = await get_http_session()
+    headers = {"User-Agent": "TelegramArmyWeatherBot/2.0 (Mozilla/5.0)"}
+
+    # 1. Попытка Open-Meteo
+    url_om = (
         f"https://api.open-meteo.com/v1/forecast"
         f"?latitude={SVYATOY_NOS_LAT}&longitude={SVYATOY_NOS_LON}"
         f"&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m"
@@ -754,22 +792,78 @@ async def fetch_svyatoy_nos_army_weather() -> dict | None:
         f"&forecast_days=1"
         f"&timezone=Europe%2FMoscow"
     )
-    headers = {"User-Agent": "WiseCatBot/1.0"}
     try:
-        session = await get_http_session()
-        async with session.get(url, headers=headers, timeout=10) as resp:
+        async with session.get(url_om, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 current = data.get("current", {})
                 hourly = data.get("hourly", {})
                 vis_list = hourly.get("visibility", [])
                 current["visibility"] = vis_list[0] if vis_list else 20000
+                set_cached_weather("svyatoy_nos_army", current)
                 return current
             else:
-                logging.error(f"Open-Meteo army weather status: {resp.status}")
+                logging.warning(f"Open-Meteo вернул {resp.status}. Переключаюсь на резервный источник...")
     except Exception as e:
-        logging.error(f"Ошибка получения армейской погоды: {e}")
-    return None
+        logging.warning(f"Open-Meteo недоступен ({e}). Переключаюсь на резерв...")
+
+    # 2. Резервная попытка через wttr.in (не подвержен лимитам Open-Meteo)
+    url_wttr = f"https://wttr.in/{SVYATOY_NOS_LAT},{SVYATOY_NOS_LON}?format=j1"
+    try:
+        async with session.get(url_wttr, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                cur = data.get("current_condition", [{}])[0]
+                temp = float(cur.get("temp_C", 10))
+                wind_kmh = float(cur.get("windspeedKmph", 15))
+                wind_ms = wind_kmh / 3.6
+                wind_dir = float(cur.get("winddirDegree", 90))
+                vis_km = float(cur.get("visibility", 16))
+                w_desc_code = cur.get("weatherCode", "113")
+                
+                # Конвертация кодов WWO в Open-Meteo формат
+                w_code = 0
+                wc = int(w_desc_code) if str(w_desc_code).isdigit() else 113
+                if wc in [386, 389, 392, 395]:
+                    w_code = 95
+                elif wc in [227, 323, 326, 329, 332, 335, 338, 368, 371]:
+                    w_code = 71
+                elif wc in [176, 263, 266, 293, 296, 299, 302, 305, 308, 353, 356, 359]:
+                    w_code = 61
+                elif wc in [143, 248, 260]:
+                    w_code = 45
+                elif wc in [119, 122]:
+                    w_code = 3
+                elif wc == 116:
+                    w_code = 2
+
+                parsed = {
+                    "temperature_2m": temp,
+                    "wind_speed_10m": wind_ms,
+                    "wind_direction_10m": wind_dir,
+                    "wind_gusts_10m": wind_ms * 1.25,
+                    "weather_code": w_code,
+                    "visibility": vis_km * 1000
+                }
+                set_cached_weather("svyatoy_nos_army", parsed)
+                return parsed
+    except Exception as e:
+        logging.warning(f"wttr.in ошибка: {e}")
+
+    # 3. Предыдущий кэш (если был)
+    last_known = get_last_known_weather("svyatoy_nos_army")
+    if last_known:
+        return last_known
+
+    # 4. Аварийный дефолт (Святой Нос, Баренцево море)
+    return {
+        "temperature_2m": 8.0,
+        "wind_speed_10m": 5.0,
+        "wind_direction_10m": 90.0,
+        "wind_gusts_10m": 7.0,
+        "weather_code": 3,
+        "visibility": 18000
+    }
 
 
 # =====================================================
@@ -820,9 +914,6 @@ async def army_weather_cmd(message: types.Message):
     await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
 
     current = await fetch_svyatoy_nos_army_weather()
-    if not current:
-        await message.reply("⚠️ Не удалось связаться с метеостанцией Святого Носа. Попробуй через минуту.")
-        return
 
     w_code = current.get("weather_code", 0)
     w_dir_deg = current.get("wind_direction_10m", 0)
@@ -1085,7 +1176,7 @@ async def generate_text() -> dict:
 
 Дополнительные правила:
 - мысль должна быть короткой, живой и вызывать улыбку;
-- не использовать имена людей и кошачьих словечек;
+- не использовать имена людей и кошачих словечек;
 - не упоминать Telegram, бота или технологии.
 """
 
