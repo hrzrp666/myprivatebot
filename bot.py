@@ -769,55 +769,33 @@ def encode_army_sea_state(wind_speed_ms: float) -> tuple[str, str]:
 
 async def fetch_svyatoy_nos_army_weather() -> dict:
     """
-    Получает реальную погоду с защитой от 429 и правильным парсингом резервных источников.
+    Получает актуальные метеоданные Святого Носа.
+    1. Кэш в памяти (10 минут).
+    2. Основной источник: wttr.in (без лимитов 429).
+    3. Резерв: Open-Meteo.
     """
     cached = get_cached_weather("svyatoy_nos_army")
     if cached:
         return cached
 
     session = await get_http_session()
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) TelegramArmyBot/2.0"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"}
 
-    # 1. Попытка Open-Meteo
-    url_om = (
-        f"https://api.open-meteo.com/v1/forecast"
-        f"?latitude={SVYATOY_NOS_LAT}&longitude={SVYATOY_NOS_LON}"
-        f"&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m"
-        f"&hourly=visibility"
-        f"&wind_speed_unit=ms"
-        f"&forecast_days=1"
-        f"&timezone=Europe%2FMoscow"
-    )
-    try:
-        async with session.get(url_om, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-            if resp.status == 200:
-                data = await resp.json(content_type=None)
-                current = data.get("current", {})
-                hourly = data.get("hourly", {})
-                vis_list = hourly.get("visibility", [])
-                current["visibility"] = vis_list[0] if vis_list else 20000
-                set_cached_weather("svyatoy_nos_army", current)
-                return current
-            else:
-                logging.warning(f"Open-Meteo вернул {resp.status}. Переключаюсь на wttr.in...")
-    except Exception as e:
-        logging.warning(f"Open-Meteo недоступен ({e}). Переключаюсь на wttr.in...")
-
-    # 2. Резервный источник wttr.in (с отключенной строгой проверкой mimetype)
+    # 1. Основной запрос к wttr.in
     url_wttr = f"https://wttr.in/{SVYATOY_NOS_LAT},{SVYATOY_NOS_LON}?format=j1"
     try:
-        async with session.get(url_wttr, headers=headers, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+        async with session.get(url_wttr, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
             if resp.status == 200:
                 data = await resp.json(content_type=None)
                 cur = data.get("current_condition", [{}])[0]
                 temp = float(cur.get("temp_C", 5))
                 wind_kmh = float(cur.get("windspeedKmph", 15))
                 wind_ms = wind_kmh / 3.6
-                wind_dir = float(cur.get("winddirDegree", 0))
+                wind_dir = float(cur.get("winddirDegree", 90))
                 vis_km = float(cur.get("visibility", 10))
                 w_desc_code = cur.get("weatherCode", "113")
                 
-                # Конвертация кодов погоды
+                # Маппинг погоды в коды
                 w_code = 0
                 wc = int(w_desc_code) if str(w_desc_code).isdigit() else 113
                 if wc in [386, 389, 392, 395]:
@@ -842,26 +820,49 @@ async def fetch_svyatoy_nos_army_weather() -> dict:
                     "visibility": vis_km * 1000
                 }
                 set_cached_weather("svyatoy_nos_army", parsed)
-                logging.info("Погода для Пахи успешно получена через резервный wttr.in")
+                logging.info("Погода Святого Носа успешно получена через wttr.in")
                 return parsed
             else:
-                logging.warning(f"wttr.in вернул {resp.status}")
+                logging.warning(f"wttr.in статус {resp.status}. Пробую Open-Meteo...")
     except Exception as e:
-        logging.warning(f"wttr.in ошибка: {e}")
+        logging.warning(f"wttr.in ошибка ({e}). Пробую Open-Meteo...")
 
-    # 3. Предыдущий кэш (если был)
+    # 2. Резерв: Open-Meteo
+    url_om = (
+        f"https://api.open-meteo.com/v1/forecast"
+        f"?latitude={SVYATOY_NOS_LAT}&longitude={SVYATOY_NOS_LON}"
+        f"&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m"
+        f"&hourly=visibility"
+        f"&wind_speed_unit=ms"
+        f"&forecast_days=1"
+        f"&timezone=Europe%2FMoscow"
+    )
+    try:
+        async with session.get(url_om, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status == 200:
+                data = await resp.json(content_type=None)
+                current = data.get("current", {})
+                hourly = data.get("hourly", {})
+                vis_list = hourly.get("visibility", [])
+                current["visibility"] = vis_list[0] if vis_list else 20000
+                set_cached_weather("svyatoy_nos_army", current)
+                return current
+    except Exception as e:
+        logging.warning(f"Open-Meteo ошибка: {e}")
+
+    # 3. Предыдущий кэш
     last_known = get_last_known_weather("svyatoy_nos_army")
     if last_known:
         return last_known
 
     # 4. Аварийный дефолт
     return {
-        "temperature_2m": 5.0,
+        "temperature_2m": 6.0,
         "wind_speed_10m": 4.0,
         "wind_direction_10m": 90.0,
-        "wind_gusts_10m": 6.0,
+        "wind_gusts_10m": 5.0,
         "weather_code": 3,
-        "visibility": 18000
+        "visibility": 10000
     }
 
 
@@ -926,7 +927,13 @@ async def army_weather_cmd(message: types.Message):
     wspd_code = f"{max(0, min(99, w_spd_ms)):02d}"
     vis_code, vis_text = encode_army_visibility(vis_m)
     temp_code = f"{abs(temp):02d}"
-    sea_code, sea_text = encode_army_sea_state(w_spd_ms)
+
+    # Армейское правило: если видимость <= 3 (5 каб и меньше), море не видно -> "XX"
+    if int(vis_code) <= 3:
+        sea_code = "XX"
+        sea_text = "XX (море не просматривается из-за видимости)"
+    else:
+        sea_code, sea_text = encode_army_sea_state(w_spd_ms)
 
     full_code = f"{ph_code}{wdir_code}{wspd_code}{vis_code}{temp_code}{sea_code}"
 
