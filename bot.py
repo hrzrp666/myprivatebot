@@ -89,6 +89,10 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
+# Отключаем лишний спам логов от Google SDK
+logging.getLogger("google_genai").setLevel(logging.ERROR)
+logging.getLogger("google.genai").setLevel(logging.ERROR)
+
 
 # =====================================================
 # CONFIG FOR NEW FEATURES
@@ -240,13 +244,11 @@ async def get_weather_day(lat: float, lon: float) -> dict:
         "🌆 Вечер": "нет данных"
     }
 
-    # Идентификация приложения снижает риск блокировки
     headers = {"User-Agent": "WiseCatBot/1.0"}
 
     try:
         session = await get_http_session()
         
-        # Делаем до 3 попыток при сбоях сети или статусе 429
         for attempt in range(3):
             async with session.get(url, headers=headers, timeout=10) as resp:
                 if resp.status == 200:
@@ -661,6 +663,116 @@ async def save_post_today():
 
 
 # =====================================================
+# АРМЕЙСКАЯ СВОДКА ДЛЯ ПАХИ (МЫС СВЯТОЙ НОС)
+# =====================================================
+
+def encode_army_phenomenon(weather_code: int, wind_gusts_ms: float = 0) -> tuple[str, str]:
+    if wind_gusts_ms >= 18.0 and weather_code in [61, 63, 65, 80, 81, 82, 95]:
+        return "01", "Шквал"
+    if weather_code == 95:
+        return "13", "Гроза"
+    if weather_code in [71, 73, 75, 85, 86]:
+        return "09", "Снег"
+    if weather_code in [61, 63, 65, 80, 81, 82]:
+        return "08", "Дождь"
+    if weather_code in [51, 53, 55]:
+        return "07", "Морось"
+    if weather_code in [45, 48]:
+        return "06", "Туман"
+    if weather_code in [1, 2, 3]:
+        return "03", "Дымка"
+    return "00", "Без особых явлений"
+
+
+def encode_army_wind_dir(degrees: float) -> tuple[str, str]:
+    deg = degrees % 360
+    if 22.5 <= deg < 67.5:
+        return "1", "Северо-восточный"
+    elif 67.5 <= deg < 112.5:
+        return "2", "Восточный"
+    elif 112.5 <= deg < 157.5:
+        return "3", "Юго-восточный"
+    elif 157.5 <= deg < 202.5:
+        return "4", "Южный"
+    elif 202.5 <= deg < 247.5:
+        return "5", "Юго-западный"
+    elif 247.5 <= deg < 292.5:
+        return "6", "Западный"
+    elif 292.5 <= deg < 337.5:
+        return "7", "Северо-западный"
+    else:
+        return "8", "Северный"
+
+
+def encode_army_visibility(vis_meters: float) -> tuple[str, str]:
+    if vis_meters >= 18000:
+        return "7", "10 миль"
+    elif vis_meters >= 9000:
+        return "6", "5 миль"
+    elif vis_meters >= 4500:
+        return "5", "2,5 мили"
+    elif vis_meters >= 1800:
+        return "4", "1 миля"
+    elif vis_meters >= 900:
+        return "3", "5 кабельтовых"
+    elif vis_meters >= 400:
+        return "2", "2–3 кабельтова"
+    else:
+        return "1", "1 кабельтов"
+
+
+def encode_army_sea_state(wind_speed_ms: float) -> tuple[str, str]:
+    if wind_speed_ms < 1.0:
+        return "00", "Штиль"
+    elif wind_speed_ms <= 3.3:
+        return "10", "1 балл"
+    elif wind_speed_ms <= 5.4:
+        return "20", "2 балла"
+    elif wind_speed_ms <= 7.9:
+        return "30", "3 балла"
+    elif wind_speed_ms <= 10.7:
+        return "40", "4 балла"
+    elif wind_speed_ms <= 13.8:
+        return "50", "5 баллов"
+    elif wind_speed_ms <= 17.1:
+        return "60", "6 баллов"
+    elif wind_speed_ms <= 20.7:
+        return "70", "7 баллов"
+    elif wind_speed_ms <= 24.4:
+        return "80", "8 баллов"
+    else:
+        return "90", "9 баллов"
+
+
+async def fetch_svyatoy_nos_army_weather() -> dict | None:
+    url = (
+        f"https://api.open-meteo.com/v1/forecast"
+        f"?latitude={SVYATOY_NOS_LAT}&longitude={SVYATOY_NOS_LON}"
+        f"&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m"
+        f"&hourly=visibility"
+        f"&wind_speed_unit=ms"
+        f"&forecast_days=1"
+        f"&timezone=Europe%2FMoscow"
+    )
+    headers = {"User-Agent": "WiseCatBot/1.0"}
+    try:
+        session = await get_http_session()
+        async with session.get(url, headers=headers, timeout=10) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                current = data.get("current", {})
+                hourly = data.get("hourly", {})
+                vis_list = hourly.get("visibility", [])
+                current["visibility"] = vis_list[0] if vis_list else 20000
+                return current
+            else:
+                logging.error(f"Open-Meteo army weather status: {resp.status}")
+    except Exception as e:
+        logging.error(f"Ошибка получения армейской погоды: {e}")
+    return None
+
+
+# =====================================================
 # COMMANDS
 # =====================================================
 
@@ -673,6 +785,7 @@ async def start(
         "🧙 Мудрец Мяумяура запущен.\n\n"
         "📜 <b>Мои возможности:</b>\n"
         "• Каждое утро в 09:00 — Мысль дня и погода\n"
+        "• /code или /паха — Армейский шифр погоды на Святом Носе\n"
         "• /question &lt;вопрос&gt; — Спросить мудреца\n"
         "• /summary — Краткая выжимка (что пропустили в чате)\n"
         "• Каждое воскресенье в 20:00 — Итоги недели"
@@ -699,6 +812,48 @@ async def test(
     await create_daily_post(
         force=True
     )
+
+
+@dp.message(Command("code", "paha", "svodka", "погода", "сводка", "код", "паха"))
+async def army_weather_cmd(message: types.Message):
+    """Генератор армейского 10-значного кода для вахты Пахи на Святом Носе."""
+    await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+
+    current = await fetch_svyatoy_nos_army_weather()
+    if not current:
+        await message.reply("⚠️ Не удалось связаться с метеостанцией Святого Носа. Попробуй через минуту.")
+        return
+
+    w_code = current.get("weather_code", 0)
+    w_dir_deg = current.get("wind_direction_10m", 0)
+    w_spd_ms = round(current.get("wind_speed_10m", 0))
+    w_gusts_ms = round(current.get("wind_gusts_10m", 0))
+    temp = round(current.get("temperature_2m", 10))
+    vis_m = current.get("visibility", 20000)
+
+    ph_code, ph_text = encode_army_phenomenon(w_code, w_gusts_ms)
+    wdir_code, wdir_text = encode_army_wind_dir(w_dir_deg)
+    wspd_code = f"{max(0, min(99, w_spd_ms)):02d}"
+    vis_code, vis_text = encode_army_visibility(vis_m)
+    temp_code = f"{abs(temp):02d}"
+    sea_code, sea_text = encode_army_sea_state(w_spd_ms)
+
+    full_code = f"{ph_code}{wdir_code}{wspd_code}{vis_code}{temp_code}{sea_code}"
+
+    response = (
+        f"🫡 <b>Метеосводка для Пахи (мыс Святой Нос):</b>\n\n"
+        f"📟 Готовый код: <code>{full_code}</code>\n\n"
+        f"<b>Расшифровка:</b>\n"
+        f"• <b>Явление [{ph_code}]:</b> {ph_text}\n"
+        f"• <b>Ветер [{wdir_code}]:</b> {wdir_text}\n"
+        f"• <b>Скорость [{wspd_code}]:</b> {w_spd_ms} м/с\n"
+        f"• <b>Видимость [{vis_code}]:</b> {vis_text}\n"
+        f"• <b>Температура [{temp_code}]:</b> {temp}°C\n"
+        f"• <b>Море [{sea_code}]:</b> {sea_text}\n\n"
+        f"<i>Служи спокойно, Паша, Мудрец всё посчитал!</i>"
+    )
+
+    await message.reply(response)
 
 
 @dp.message(Command("question"))
@@ -836,157 +991,7 @@ async def collect(
         logging.error(
             f"Ошибка сохранения сообщения: {e}"
         )
-        
-# =====================================================
-# ГЕНЕРАТОР АРМЕЙСКОЙ СВОДКИ (СВЯТОЙ НОС ДЛЯ ПАХИ)
-# =====================================================
 
-def encode_army_phenomenon(weather_code: int, wind_gusts_ms: float = 0) -> tuple[str, str]:
-    if wind_gusts_ms >= 18.0 and weather_code in [61, 63, 65, 80, 81, 82, 95]:
-        return "01", "Шквал"[cite: 1]
-    if weather_code == 95:
-        return "13", "Гроза"[cite: 1]
-    if weather_code in [71, 73, 75, 85, 86]:
-        return "09", "Снег"[cite: 1]
-    if weather_code in [61, 63, 65, 80, 81, 82]:
-        return "08", "Дождь"[cite: 1]
-    if weather_code in [51, 53, 55]:
-        return "07", "Морось"[cite: 1]
-    if weather_code in [45, 48]:
-        return "06", "Туман"[cite: 1]
-    if weather_code in [1, 2, 3]:
-        return "03", "Дымка"[cite: 1]
-    return "00", "Без особых явлений"
-
-
-def encode_army_wind_dir(degrees: float) -> tuple[str, str]:
-    deg = degrees % 360
-    if 22.5 <= deg < 67.5:
-        return "1", "Северо-восточный"[cite: 1]
-    elif 67.5 <= deg < 112.5:
-        return "2", "Восточный"[cite: 1]
-    elif 112.5 <= deg < 157.5:
-        return "3", "Юго-восточный"[cite: 1]
-    elif 157.5 <= deg < 202.5:
-        return "4", "Южный"[cite: 1]
-    elif 202.5 <= deg < 247.5:
-        return "5", "Юго-западный"[cite: 1]
-    elif 247.5 <= deg < 292.5:
-        return "6", "Западный"[cite: 1]
-    elif 292.5 <= deg < 337.5:
-        return "7", "Северо-западный"[cite: 1]
-    else:
-        return "8", "Северный"[cite: 1]
-
-
-def encode_army_visibility(vis_meters: float) -> tuple[str, str]:
-    if vis_meters >= 18000:
-        return "7", "10 миль"[cite: 1]
-    elif vis_meters >= 9000:
-        return "6", "5 миль"[cite: 1]
-    elif vis_meters >= 4500:
-        return "5", "2,5 мили"[cite: 1]
-    elif vis_meters >= 1800:
-        return "4", "1 миля"[cite: 1]
-    elif vis_meters >= 900:
-        return "3", "5 кабельтовых"[cite: 1]
-    elif vis_meters >= 400:
-        return "2", "2–3 кабельтова"[cite: 1]
-    else:
-        return "1", "1 кабельтов"[cite: 1]
-
-
-def encode_army_sea_state(wind_speed_ms: float) -> tuple[str, str]:
-    if wind_speed_ms < 1.0:
-        return "00", "Штиль"[cite: 1]
-    elif wind_speed_ms <= 3.3:
-        return "10", "1 балл"[cite: 1]
-    elif wind_speed_ms <= 5.4:
-        return "20", "2 балла"[cite: 1]
-    elif wind_speed_ms <= 7.9:
-        return "30", "3 балла"[cite: 1]
-    elif wind_speed_ms <= 10.7:
-        return "40", "4 балла"[cite: 1]
-    elif wind_speed_ms <= 13.8:
-        return "50", "5 баллов"[cite: 1]
-    elif wind_speed_ms <= 17.1:
-        return "60", "6 баллов"[cite: 1]
-    elif wind_speed_ms <= 20.7:
-        return "70", "7 баллов"[cite: 1]
-    elif wind_speed_ms <= 24.4:
-        return "80", "8 баллов"[cite: 1]
-    else:
-        return "90", "9 баллов"[cite: 1]
-
-
-async def fetch_svyatoy_nos_army_weather() -> dict | None:
-    url = (
-        f"https://api.open-meteo.com/v1/forecast"
-        f"?latitude={SVYATOY_NOS_LAT}&longitude={SVYATOY_NOS_LON}"
-        f"&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m"
-        f"&hourly=visibility"
-        f"&wind_speed_unit=ms"
-        f"&forecast_hours=2"
-        f"&timezone=Europe%2FMoscow"
-    )
-    headers = {"User-Agent": "WiseCatBot/1.0"}
-    try:
-        session = await get_http_session()
-        async with session.get(url, headers=headers, timeout=10) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                current = data.get("current", {})
-                hourly = data.get("hourly", {})
-                vis_list = hourly.get("visibility", [])
-                current["visibility"] = vis_list[0] if vis_list else 20000
-                return current
-            else:
-                logging.error(f"Open-Meteo army weather status: {resp.status}")
-    except Exception as e:
-        logging.error(f"Ошибка получения армейской погоды: {e}")
-    return None
-
-
-@dp.message(Command("code", "paha", "svodka"))
-async def army_weather_cmd(message: types.Message):
-    """Генератор армейского 10-значного кода для вахты Пахи на Святом Носе."""
-    await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-
-    current = await fetch_svyatoy_nos_army_weather()
-    if not current:
-        await message.reply("⚠️ Не удалось связаться с метеостанцией Святого Носа. Попробуй через минуту.")
-        return
-
-    w_code = current.get("weather_code", 0)
-    w_dir_deg = current.get("wind_direction_10m", 0)
-    w_spd_ms = round(current.get("wind_speed_10m", 0))
-    w_gusts_ms = round(current.get("wind_gusts_10m", 0))
-    temp = round(current.get("temperature_2m", 10))
-    vis_m = current.get("visibility", 20000)
-
-    ph_code, ph_text = encode_army_phenomenon(w_code, w_gusts_ms)
-    wdir_code, wdir_text = encode_army_wind_dir(w_dir_deg)
-    wspd_code = f"{max(0, min(99, w_spd_ms)):02d}"
-    vis_code, vis_text = encode_army_visibility(vis_m)
-    temp_code = f"{abs(temp):02d}"
-    sea_code, sea_text = encode_army_sea_state(w_spd_ms)
-
-    full_code = f"{ph_code}{wdir_code}{wspd_code}{vis_code}{temp_code}{sea_code}"
-
-    response = (
-        f"🫡 <b>Метеосводка для Пахи (мыс Святой Нос):</b>\n\n"
-        f"📟 Готовый код: <code>{full_code}</code>\n\n"
-        f"<b>Расшифровка:</b>\n"
-        f"• <b>Явление [{ph_code}]:</b> {ph_text}\n"
-        f"• <b>Ветер [{wdir_code}]:</b> {wdir_text}\n"
-        f"• <b>Скорость [{wspd_code}]:</b> {w_spd_ms} м/с\n"
-        f"• <b>Видимость [{vis_code}]:</b> {vis_text}\n"
-        f"• <b>Температура [{temp_code}]:</b> {temp}°C\n"
-        f"• <b>Море [{sea_code}]:</b> {sea_text}\n\n"
-        f"<i>Служи спокойно, Паша, Мудрец всё посчитал!</i>"
-    )
-
-    await message.reply(response)
 
 # =====================================================
 # GEMINI HELPER (RETRY & FALLBACK)
@@ -1281,6 +1286,7 @@ async def send_weekly_digest():
         logging.info("Недельный дайджест успешно отправлен")
     except Exception as e:
         logging.error(f"Ошибка отправки дайджеста: {e}")
+
 
 # =====================================================
 # SCHEDULER
