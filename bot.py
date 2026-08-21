@@ -6,6 +6,7 @@ import json
 import html
 import random
 import time
+import re
 import aiohttp
 
 from datetime import datetime, timedelta
@@ -54,7 +55,7 @@ if not CHAT_ID:
 CHAT_ID = int(CHAT_ID)
 
 
-# Координаты для погоды Open-Meteo
+# Координаты основных точек
 KULTUK_LAT, KULTUK_LON = 51.7208, 103.6828
 SVYATOY_NOS_LAT, SVYATOY_NOS_LON = 68.0811, 39.7619
 
@@ -124,10 +125,10 @@ WISDOM_SYSTEM_INSTRUCTION = (
     "2. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНЫ ПОДХАЛИМАЖ, ЛЕСТЬ И СЮСЮКАНЬЕ (не будь подсосом!). Общайся уверенно, по-пацански, на равных, без пафоса и заумной метафизики.\n"
     "3. ТЫ ВСЕГДА ЗНАЕШЬ И ПОМНИШЬ ВСЮ КОМПАНИЮ И ГЕОГРАФИЮ:\n"
     "   - Захар (@zaharyan14) — твой самый лучший, главный и близкий кент (вы лучшие кенты), самый жёсткий и авторитетный в банде. За него ты всегда горой. Если кто-то спрашивает, кто твой лучший кент или кто тут главный — это ВСЕГДА Захар.\n"
-    "   - Паша (@tombarket) — служит в армии на МЫСЕ СВЯТОЙ НОС (Баренцево море, Кольский полуостров, Северный флот / Мурманская область). Это крайний Север, Заполярье! Категорически ЗАПРЕЩЕНО путать его службу с Байкалом! К Паше относись с братским уважением и поддержкой.\n"
+    "   - Паша (@tombarket) — служит в армии на МЫСЕ СВЯТОЙ НОС (Баренцево море, Кольский полуостров, Северный флот / Мурманская область). Это Заполярье! Не путай с Байкалом! К Паше относись с братским уважением и поддержкой.\n"
     "   - Илья (@Akishinov) — нефтяник. Любит выпендриваться деньгами, вахтами и статусом. С ним общайся ровно, НЕ подлизывайся, приземляй его добрыми подколами про выкачивание нефти, баррели, бабло или работу. Если Илья спрашивает 'кто лучше' или 'кто успешнее' — ставь его на место с иронией, напоминая про Захара и Пашку.\n"
-    "   - Култук — это Байкал (Иркутская область). Святой Нос для Пахи — это Баренцево море (Север).\n"
-    "4. Если спрашивают про погоду — отвечай СТРОГО ПО ФАКТУ И ЦИФРАМ из предоставленных метеоданных, без выдумок и занудства.\n"
+    "   - Култук — это поселок на Байкале (Иркутская область).\n"
+    "4. ЕСЛИ СПРАШИВАЮТ ПРО ПОГОДУ: Отвечай СТРОГО ПО ФАКТУ, используя предоставленные реальные данные метеослужбы (градусы, ветер, осадки). Ни в коем случае не придумывай температуру от себя!\n"
     "5. Ответы держи компактными — строго 2–3 ёмких и живых предложения."
 )
 
@@ -141,7 +142,7 @@ USER_PROFILES = {
     ),
     "tombarket": (
         "Ты общаешься с Пашей (@tombarket). Он сейчас служит на Крайнем Севере — мыс Святой Нос (Баренцево море, Мурманская область). "
-        "Ни в коем случае не приплетай Байкал! Давай ему конкретные, четкие, мудрые и дружеские ответы по факту, поддерживай его службу."
+        "Давай ему конкретные, четкие, мудрые и дружеские ответы по факту, поддерживай его службу."
     ),
     "akishinov": (
         "Ты общаешься с Ильёй (@Akishinov). Он работает нефтяником. "
@@ -251,7 +252,7 @@ class DailyPostSchema(BaseModel):
 
 
 # =====================================================
-# OPEN-METEO WEATHER API
+# WEATHER & FORECAST HELPERS
 # =====================================================
 
 async def get_weather_day(lat: float, lon: float) -> dict:
@@ -328,24 +329,71 @@ async def get_weather_day(lat: float, lon: float) -> dict:
         return fallback
 
 
-async def get_detailed_forecast_svyatoy_nos() -> str:
-    """Получает детальный текстовый прогноз на сегодня и завтра для мыса Святой Нос."""
+async def fetch_dynamic_weather(query_text: str) -> str:
+    """
+    Универсальный помощник: находит любую локацию из вопроса пользователя
+    и достает реальный точный прогноз погоды (сегодня, завтра, утро, день, вечер).
+    """
+    q_lower = query_text.lower()
+    
+    # 1. Распознавание ключевых локаций компании
+    if any(k in q_lower for k in ["свято", "нос", "паш", "пах"]):
+        target_loc = f"{SVYATOY_NOS_LAT},{SVYATOY_NOS_LON}"
+        loc_name = "Мыс Святой Нос (Баренцево море, Мурманская область)"
+    elif "култук" in q_lower:
+        target_loc = f"{KULTUK_LAT},{KULTUK_LON}"
+        loc_name = "Култук (Иркутская область, Байкал)"
+    elif "иркутск" in q_lower:
+        target_loc = "Иркутск"
+        loc_name = "Иркутск"
+    elif "москв" in q_lower:
+        target_loc = "Москва"
+        loc_name = "Москва"
+    elif "питер" in q_lower or "петербург" in q_lower:
+        target_loc = "Санкт-Петербург"
+        loc_name = "Санкт-Петербург"
+    else:
+        # Попытка вытащить название города после предлогов
+        match = re.search(r'(?:в|во|на|по|городе|город)\s+([а-яА-Яa-zA-Z0-9\-]+)', q_lower)
+        if match:
+            extracted = match.group(1).strip()
+            stop_words = ["утром", "вечером", "ночью", "день", "завтра", "сегодня", "понедельник", "вторник", "среду", "четверг", "пятницу", "субботу", "воскресенье"]
+            if extracted not in stop_words and len(extracted) > 2:
+                target_loc = extracted
+                loc_name = extracted.capitalize()
+            else:
+                target_loc = f"{KULTUK_LAT},{KULTUK_LON}"
+                loc_name = "Култук (Байкал)"
+        else:
+            target_loc = f"{KULTUK_LAT},{KULTUK_LON}"
+            loc_name = "Култук (Байкал)"
+
     session = await get_http_session()
     headers = {"User-Agent": "Mozilla/5.0"}
-    url_wttr = f"https://wttr.in/{SVYATOY_NOS_LAT},{SVYATOY_NOS_LON}?format=j1"
+    url_wttr = f"https://wttr.in/{target_loc}?format=j1"
+    
     try:
         async with session.get(url_wttr, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
             if resp.status == 200:
                 data = await resp.json(content_type=None)
+                cur = data.get("current_condition", [{}])[0]
+                cur_temp = cur.get("temp_C", "?")
+                cur_wind = round(float(cur.get("windspeedKmph", 0)) / 3.6)
+                cur_desc = cur.get("lang_ru", [{}])[0].get("value", "") if cur.get("lang_ru") else "ясно"
+
                 weather_days = data.get("weather", [])
-                lines = []
+                lines = [
+                    f"Локация: {loc_name}",
+                    f"Сейчас: {cur_temp}°C, {cur_desc}, ветер {cur_wind} м/с"
+                ]
+
                 for i, wday in enumerate(weather_days[:2]):
                     date_label = "Сегодня" if i == 0 else "Завтра"
-                    avg_temp = wday.get("avgtempC", "?")
                     max_temp = wday.get("maxtempC", "?")
                     min_temp = wday.get("mintempC", "?")
                     hourly = wday.get("hourly", [])
-                    # Утро (~09:00), День (~15:00), Вечер (~21:00)
+
+                    # утро (~09:00 - index 3), день (~15:00 - index 5), вечер (~21:00 - index 7)
                     m_temp = hourly[3].get("tempC", "?") if len(hourly) > 3 else "?"
                     m_desc = hourly[3].get("lang_ru", [{}])[0].get("value", "") if len(hourly) > 3 and hourly[3].get("lang_ru") else "ясно"
                     m_wind = round(float(hourly[3].get("windspeedKmph", 0)) / 3.6) if len(hourly) > 3 else "?"
@@ -354,15 +402,22 @@ async def get_detailed_forecast_svyatoy_nos() -> str:
                     d_desc = hourly[5].get("lang_ru", [{}])[0].get("value", "") if len(hourly) > 5 and hourly[5].get("lang_ru") else "ясно"
                     d_wind = round(float(hourly[5].get("windspeedKmph", 0)) / 3.6) if len(hourly) > 5 else "?"
 
+                    e_temp = hourly[7].get("tempC", "?") if len(hourly) > 7 else "?"
+                    e_desc = hourly[7].get("lang_ru", [{}])[0].get("value", "") if len(hourly) > 7 and hourly[7].get("lang_ru") else "ясно"
+                    e_wind = round(float(hourly[7].get("windspeedKmph", 0)) / 3.6) if len(hourly) > 7 else "?"
+
                     lines.append(
-                        f"• {date_label} ({wday.get('date')}): Днем {max_temp}°C, Ночью {min_temp}°C. "
-                        f"Утром: {m_temp}°C ({m_desc}, ветер {m_wind} м/с). "
-                        f"Днем: {d_temp}°C ({d_desc}, ветер {d_wind} м/с)."
+                        f"• {date_label} ({wday.get('date')}): "
+                        f"Днем максимум {max_temp}°C, ночью минимум {min_temp}°C. "
+                        f"Утро: {m_temp}°C ({m_desc}, ветер {m_wind} м/с). "
+                        f"День: {d_temp}°C ({d_desc}, ветер {d_wind} м/с). "
+                        f"Вечер: {e_temp}°C ({e_desc}, ветер {e_wind} м/с)."
                     )
                 return "\n".join(lines)
     except Exception as e:
-        logging.warning(f"Не удалось получить детальный прогноз для промпта: {e}")
-    return "Мыс Святой Нос (Баренцево море): температура около +4..+8°C, ветер 5–9 м/с, морской воздух."
+        logging.warning(f"Ошибка запроса погоды wttr.in ({target_loc}): {e}")
+
+    return f"Локация: {loc_name}. (Данные временно недоступны)."
 
 
 # =====================================================
@@ -807,12 +862,7 @@ def encode_army_sea_state(wind_speed_ms: float) -> tuple[str, str]:
 
 
 async def fetch_svyatoy_nos_army_weather() -> dict:
-    """
-    Получает актуальные метеоданные Святого Носа.
-    1. Кэш в памяти (10 минут).
-    2. Основной источник: wttr.in.
-    3. Резерв: Open-Meteo.
-    """
+    """Получает актуальные метеоданные Святого Носа."""
     cached = get_cached_weather("svyatoy_nos_army")
     if cached:
         return cached
@@ -861,8 +911,6 @@ async def fetch_svyatoy_nos_army_weather() -> dict:
                 set_cached_weather("svyatoy_nos_army", parsed)
                 logging.info("Погода Святого Носа успешно получена через wttr.in")
                 return parsed
-            else:
-                logging.warning(f"wttr.in статус {resp.status}. Пробую Open-Meteo...")
     except Exception as e:
         logging.warning(f"wttr.in ошибка ({e}). Пробую Open-Meteo...")
 
@@ -1177,20 +1225,20 @@ async def ask_wisdom(user_question: str, user: types.User | None = None) -> str:
     username_tag = f"@{user.username}" if user and user.username else user_name
     q_lower = user_question.lower()
 
-    # Если в вопросе спрашивают про погоду/ветер/градусы — подтягиваем реальный прогноз
+    # Если в вопросе спрашивают про погоду/ветер/градусы — динамически подтягиваем реальный прогноз для нужного места
     weather_context = ""
-    if any(word in q_lower for word in ["погод", "ветер", "температур", "градус", "дожд", "снег", "утр", "завтр", "ночью", "днем"]):
-        forecast_data = await get_detailed_forecast_svyatoy_nos()
+    if any(word in q_lower for word in ["погод", "ветер", "температур", "градус", "дожд", "снег", "утр", "завтр", "ночью", "днем", "прогноз", "жар", "холод"]):
+        forecast_data = await fetch_dynamic_weather(user_question)
         weather_context = (
-            f"\n\n[РЕАЛЬНАЯ ТОЧНАЯ МЕТЕОСВОДКА (Мыс Святой Нос, Баренцево море, Север)]:\n"
+            f"\n\n[РЕАЛЬНАЯ ТОЧНАЯ МЕТЕОСВОДКА ИЗ МЕТЕОСЛУЖБЫ]:\n"
             f"{forecast_data}\n"
-            f"Используй эти РЕАЛЬНЫЕ данные, чтобы ответить на вопрос о погоде четко и по фактам."
+            f"СТРОГО ОБЯЗАТЕЛЬНО используй эти ТОЧНЫЕ цифры (температуру, ветер, осадки) для ответа! Не придумывай и не выдумывай градусы от себя!"
         )
 
     prompt = (
         f'Тебе пишет {user_name} ({username_tag}): "{user_question}"{weather_context}\n'
         'Ответь ему в своём пацанском стиле, помня роли каждого в банде (Захар — лучший кент, Паша — служит на Севере на Святом Носе в Баренцевом море, Илья — нефтяник для подколов). '
-        'Никакой лести и подхалимажа! Отвечай уверенно, с юмором и по делу (2-3 предложения).'
+        'Никакой лести и подхалимажа! Отвечай уверенно, с юмором и строго по реальным фактам (2-3 предложения).'
     )
 
     try:
