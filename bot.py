@@ -260,24 +260,33 @@ class DailyPostSchema(BaseModel):
 
 
 # =====================================================
-# VOICE TTS HELPER (EDGE-TTS)
+# VOICE TTS HELPER (EDGE-TTS С УГАРНЫМИ ГОЛОСАМИ)
 # =====================================================
 
+VOICE_PRESETS = [
+    {"name": "goblin", "pitch": "+35Hz", "rate": "+18%"},  # Гоблин
+    {"name": "orc",    "pitch": "-30Hz", "rate": "-12%"},  # Орк / Бас
+    {"name": "drunk",  "pitch": "-20Hz", "rate": "-22%"},  # Замедленный
+    {"name": "normal", "pitch": "-10Hz", "rate": "+0%"}    # Обычный ровный
+]
+
+
 async def text_to_speech_bytes(text: str) -> bytes | None:
-    """Конвертирует текст ответа в низкий ордынский бас через Edge-TTS."""
+    """Конвертирует текст ответа со случайным угарным стилем озвучки."""
     try:
         clean_text = re.sub(r'<[^>]+>', '', text)
         clean_text = re.sub(r'[^\w\s.,!?-]', '', clean_text)
         if not clean_text.strip():
             return None
 
-        # pitch="-25Hz" делает голос глубоким и басовитым
-        # rate="-8%" делает речь размеренной и суровой
+        # Выбираем случайный пресет
+        preset = random.choice(VOICE_PRESETS)
+
         communicate = edge_tts.Communicate(
             clean_text, 
             VOICE_ACTOR,
-            pitch="-25Hz",
-            rate="-8%"
+            pitch=preset["pitch"],
+            rate=preset["rate"]
         )
         
         audio_bytes = bytearray()
