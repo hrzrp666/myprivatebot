@@ -18,6 +18,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction
 from aiogram.filters import Command
+from aiogram.types import BufferedInputFile
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -27,6 +28,7 @@ from google.genai import types as genai_types
 from pydantic import BaseModel
 
 import aiosqlite
+import edge_tts
 
 
 # =====================================================
@@ -85,6 +87,10 @@ WEATHER_CODES = {
 # Иркутское время и Московское время
 TZ = ZoneInfo("Asia/Irkutsk")
 TZ_MSK = ZoneInfo("Europe/Moscow")
+
+
+# Голос для озвучки (естественный русский мужской голос)
+VOICE_ACTOR = "ru-RU-DmitryNeural"
 
 
 logging.basicConfig(
@@ -254,6 +260,29 @@ class DailyPostSchema(BaseModel):
 
 
 # =====================================================
+# VOICE TTS HELPER (EDGE-TTS)
+# =====================================================
+
+async def text_to_speech_bytes(text: str) -> bytes | None:
+    """Конвертирует текст ответа в естественный русский голос через Edge-TTS."""
+    try:
+        clean_text = re.sub(r'<[^>]+>', '', text)
+        clean_text = re.sub(r'[^\w\s.,!?-]', '', clean_text)
+        if not clean_text.strip():
+            return None
+
+        communicate = edge_tts.Communicate(clean_text, VOICE_ACTOR)
+        audio_bytes = bytearray()
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio_bytes.extend(chunk["data"])
+        return bytes(audio_bytes)
+    except Exception as e:
+        logging.warning(f"Ошибка генерации голоса Edge-TTS: {e}")
+        return None
+
+
+# =====================================================
 # WEATHER & FORECAST HELPERS
 # =====================================================
 
@@ -407,7 +436,6 @@ async def fetch_dynamic_weather(query_text: str, user: types.User | None = None)
                     min_temp = wday.get("mintempC", "?")
                     hourly = wday.get("hourly", [])
 
-                    # утро (~09:00 - index 3), день (~15:00 - index 5), вечер (~21:00 - index 7)
                     m_temp = hourly[3].get("tempC", "?") if len(hourly) > 3 else "?"
                     m_desc = hourly[3].get("lang_ru", [{}])[0].get("value", "") if len(hourly) > 3 and hourly[3].get("lang_ru") else "ясно"
                     m_wind = round(float(hourly[3].get("windspeedKmph", 0)) / 3.6) if len(hourly) > 3 else "?"
@@ -1160,6 +1188,17 @@ async def collect(
             await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
             reply_quote = message.reply_to_message.text if message.reply_to_message and message.reply_to_message.text else None
             answer = await ask_wisdom(message.text, message.from_user, reply_quote)
+            
+            # Голосовой ответ (шанс 25% или по прямому запросу на голос)
+            should_voice = (random.random() < 0.25) or any(w in message.text.lower() for w in ["голос", "скажи", "озвуч", "войс"])
+            if should_voice:
+                await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.RECORD_VOICE)
+                audio_bytes = await text_to_speech_bytes(answer)
+                if audio_bytes:
+                    voice_file = BufferedInputFile(audio_bytes, filename="wisdom.mp3")
+                    await message.reply_voice(voice=voice_file, caption=f"🧙 {html.escape(answer)}")
+                    return
+
             await message.reply(f"🧙 {html.escape(answer)}")
             return
 
@@ -1377,7 +1416,7 @@ async def generate_weekly_digest() -> str:
         )
         return response.text.strip()
     except Exception as e:
-        logging.error(f"Ошибка недельного дайджеста: {e}")
+        logging.error(f"Ошибка недели: {e}")
         return "Неделя прошла так стремительно, что даже мудрец не успел её осмыслить."
 
 
