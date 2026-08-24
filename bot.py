@@ -89,7 +89,7 @@ TZ = ZoneInfo("Asia/Irkutsk")
 TZ_MSK = ZoneInfo("Europe/Moscow")
 
 
-# Голос для озвучки (естественный русский мужской голос)
+# Голос для озвучки
 VOICE_ACTOR = "ru-RU-DmitryNeural"
 
 
@@ -279,7 +279,6 @@ async def text_to_speech_bytes(text: str) -> bytes | None:
         if not clean_text.strip():
             return None
 
-        # Выбираем случайный пресет
         preset = random.choice(VOICE_PRESETS)
 
         communicate = edge_tts.Communicate(
