@@ -842,7 +842,8 @@ async def save_post_today():
 # =====================================================
 
 def encode_army_phenomenon(weather_code: int, wind_gusts_ms: float = 0, vis_meters: float = 20000) -> tuple[str, str]:
-    has_fog = (weather_code in [45, 48] or vis_meters <= 1000)
+    # Туман определяется кодом погоды (45, 48) или ограниченной видимостью (<= 2000 м / 1 миля на мысе)
+    has_fog = (weather_code in [45, 48] or vis_meters <= 2000)
     has_rain = weather_code in [61, 63, 65, 80, 81, 82]
     has_drizzle = weather_code in [51, 53, 55]
     has_snow = weather_code in [71, 73, 75, 85, 86]
@@ -870,9 +871,9 @@ def encode_army_phenomenon(weather_code: int, wind_gusts_ms: float = 0, vis_mete
         return "07", "Морось"
     if has_fog:
         return "06", "Туман"
-    if 1000 < vis_meters <= 4000:
-        return "03", "Дымка"
-    return "00", "Без особых явлений"
+
+    # ЖЕСТКОЕ ПРАВИЛО ПАХИ: если осадков и тумана нет — в армейском рапорте ВСЕГДА пишется 03 (дымка)!
+    return "03", "Дымка"
 
 
 def encode_army_wind_dir(degrees: float) -> tuple[str, str]:
@@ -896,17 +897,17 @@ def encode_army_wind_dir(degrees: float) -> tuple[str, str]:
 
 
 def encode_army_visibility(vis_meters: float) -> tuple[str, str]:
-    if vis_meters >= 18000:
+    if vis_meters >= 14000:
         return "7", "10 миль"
-    elif vis_meters >= 9000:
+    elif vis_meters >= 7000:
         return "6", "5 миль"
-    elif vis_meters >= 4500:
+    elif vis_meters >= 3500:
         return "5", "2,5 мили"
-    elif vis_meters >= 1800:
+    elif vis_meters >= 1500:
         return "4", "1 миля"
-    elif vis_meters >= 900:
+    elif vis_meters >= 700:
         return "3", "5 кабельтовых"
-    elif vis_meters >= 400:
+    elif vis_meters >= 300:
         return "2", "2–3 кабельтова"
     else:
         return "1", "1 кабельтов"
@@ -1028,7 +1029,7 @@ async def fetch_svyatoy_nos_army_weather() -> dict:
 
 
 def build_army_code_string(current: dict) -> str:
-    """Генерирует шифр по метеоданным (с поддержкой 06/07 и 06/08)."""
+    """Генерирует шифр по метеоданным по регламенту вахты Пахи."""
     w_code = current.get("weather_code", 0)
     w_dir_deg = current.get("wind_direction_10m", 0)
     w_spd_ms = round(current.get("wind_speed_10m", 0))
@@ -1205,8 +1206,8 @@ async def collect(
             reply_quote = message.reply_to_message.text if message.reply_to_message and message.reply_to_message.text else None
             answer = await ask_wisdom(message.text, message.from_user, reply_quote)
             
-            # Голосовой ответ (шанс 25% или по прямому запросу на голос)
-            should_voice = (random.random() < 0.25) or any(w in message.text.lower() for w in ["голос", "скажи", "озвуч", "войс"])
+            # Голосовой ответ ТОЛЬКО по прямой просьбе
+            should_voice = any(w in message.text.lower() for w in ["голос", "скажи", "озвуч", "войс", "наговори", "проговори"])
             if should_voice:
                 await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.RECORD_VOICE)
                 audio_bytes = await text_to_speech_bytes(answer)
