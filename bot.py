@@ -843,14 +843,16 @@ async def save_post_today():
 
 def encode_army_phenomenon(weather_code: int, wind_gusts_ms: float = 0, vis_meters: float = 20000, humidity: float = 0, precip_mm: float = 0.0) -> tuple[str, str, float]:
     """
-    Определяет явление по таблице Пахи:
-    - При влажности >= 88% на мысе Святой Нос стоит плотный морской туман (06).
-    - Дождь (08) или морось (07) ставятся ТОЛЬКО при реальных осадках (precip_mm >= 0.2).
+    Калибровка явлений и видимости под мыс Святой Нос по военной таблице:
+    - При влажности >= 94% ставит плотный туман 06 (видимость 2 - 2-3 каб / ~400м).
+    - При влажности 88-93% ставит туман 06 (видимость 3 - 5 каб / ~850м).
+    - Дождь (08) или морось (07) только при реальных осадках (precip_mm >= 0.2).
     - Если осадков и тумана нет — в армейском рапорте пишется 03 (дымка).
-    Возвращает: (код явления, описание, скорректированная видимость)
     """
-    is_foggy = (weather_code in [45, 48] or vis_meters <= 3000 or humidity >= 88)
-    
+    is_dense_fog = (weather_code in [45, 48] or humidity >= 94.0 or vis_meters <= 1000)
+    is_light_fog = (88.0 <= humidity < 94.0 or (1000 < vis_meters <= 3000))
+    is_foggy = is_dense_fog or is_light_fog
+
     has_real_precip = precip_mm >= 0.2
     has_rain = has_real_precip and (weather_code in [61, 63, 65, 80, 81, 82])
     has_drizzle = has_real_precip and (weather_code in [51, 53, 55])
@@ -858,13 +860,15 @@ def encode_army_phenomenon(weather_code: int, wind_gusts_ms: float = 0, vis_mete
     has_thunder = weather_code == 95
     has_squall = (wind_gusts_ms >= 18.0 and (has_rain or has_snow or has_thunder))
 
-    # Корректировка видимости в морском тумане
-    actual_vis = vis_meters
-    if is_foggy:
-        if actual_vis > 2000:
-            actual_vis = 800 if humidity >= 93 else 1500
+    # Точная корректировка видимости в тумане под рельеф мыса
+    if is_dense_fog:
+        actual_vis = 400.0  # Код видимости 2 (2-3 кабельтова)
+    elif is_light_fog:
+        actual_vis = 850.0  # Код видимости 3 (5 кабельтовых)
+    else:
+        actual_vis = vis_meters
 
-    # Комбинации с туманом (только при реальном дожде)
+    # Комбинации с туманом (только при реальном дожде/мороси)
     if is_foggy and has_rain:
         return "06/08", "Туман с дождём", actual_vis
     if is_foggy and has_drizzle:
