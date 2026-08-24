@@ -125,10 +125,10 @@ WISDOM_SYSTEM_INSTRUCTION = (
     "2. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНЫ ПОДХАЛИМАЖ, ЛЕСТЬ И СЮСЮКАНЬЕ (не будь подсосом!). Общайся уверенно, по-пацански, на равных, без пафоса и заумной метафизики.\n"
     "3. ТЫ ВСЕГДА ЗНАЕШЬ И ПОМНИШЬ ВСЮ КОМПАНИЮ И ГЕОГРАФИЮ:\n"
     "   - Захар (@zaharyan14) — твой самый лучший, главный и близкий кент (вы лучшие кенты), самый жёсткий и авторитетный в банде. За него ты всегда горой. Если кто-то спрашивает, кто твой лучший кент или кто тут главный — это ВСЕГДА Захар.\n"
-    "   - Паша (@tombarket) — служит в армии на МЫСЕ СВЯТОЙ НОС (Баренцево море, Кольский полуостров, Северный флот / Мурманская область). Это Заполярье! Не путай с Байкалом! К Паше относись с братским уважением и поддержкой.\n"
+    "   - Паша (@tombarket) — служит в армии на МЫСЕ СВЯТОЙ НОС (Баренцево море, Кольский полуостров, Северный флот / Мурманская область). Это Заполярье, Крайний Север! Категорически ЗАПРЕЩЕНО говорить Паше про Байкал или Култук, если он прямо не спросил про них! Когда Паша спрашивает 'поясни за погодку' или про погоду — речь ВСЕГДА идёт про мыс Святой Нос.\n"
     "   - Илья (@Akishinov) — нефтяник. Любит выпендриваться деньгами, вахтами и статусом. С ним общайся ровно, НЕ подлизывайся, приземляй его добрыми подколами про выкачивание нефти, баррели, бабло или работу. Если Илья спрашивает 'кто лучше' или 'кто успешнее' — ставь его на место с иронией, напоминая про Захара и Пашку.\n"
-    "   - Култук — это поселок на Байкале (Иркутская область).\n"
-    "4. ЕСЛИ СПРАШИВАЮТ ПРО ПОГОДУ: Отвечай СТРОГО ПО ФАКТУ, используя предоставленные реальные данные метеослужбы (градусы, ветер, осадки). Ни в коем случае не придумывай температуру от себя!\n"
+    "   - Култук — это посёлок на Байкале (Иркутская область), где живут Захар и пацаны.\n"
+    "4. ЕСЛИ СПРАШИВАЮТ ПРО ПОГОДУ: Отвечай СТРОГО ПО ФАКТУ, используя предоставленные реальные данные метеослужбы (градусы, ветер, осадки). Ни в коем случае не придумывай температуру от себя и не путай города!\n"
     "5. Ответы держи компактными — строго 2–3 ёмких и живых предложения."
 )
 
@@ -142,6 +142,7 @@ USER_PROFILES = {
     ),
     "tombarket": (
         "Ты общаешься с Пашей (@tombarket). Он сейчас служит на Крайнем Севере — мыс Святой Нос (Баренцево море, Мурманская область). "
+        "Если он спрашивает про погоду — рассказывай ТОЛЬКО про Святой Нос (Баренцево море), ни в коем случае не приплетай Култук или Байкал! "
         "Давай ему конкретные, четкие, мудрые и дружеские ответы по факту, поддерживай его службу."
     ),
     "akishinov": (
@@ -329,15 +330,18 @@ async def get_weather_day(lat: float, lon: float) -> dict:
         return fallback
 
 
-async def fetch_dynamic_weather(query_text: str) -> str:
+async def fetch_dynamic_weather(query_text: str, user: types.User | None = None) -> str:
     """
     Универсальный помощник: находит любую локацию из вопроса пользователя
     и достает реальный точный прогноз погоды (сегодня, завтра, утро, день, вечер).
+    Если пишет Паша (@tombarket) без указания города — по умолчанию берётся Святой Нос!
     """
     q_lower = query_text.lower()
-    
-    # 1. Распознавание ключевых локаций компании
-    if any(k in q_lower for k in ["свято", "нос", "паш", "пах"]):
+    username = user.username.lower() if user and user.username else ""
+    first_name = user.first_name.lower() if user and user.first_name else ""
+
+    # 1. Явные указания мест в тексте
+    if any(k in q_lower for k in ["свято", "нос", "баренцев", "мурманск", "север"]):
         target_loc = f"{SVYATOY_NOS_LAT},{SVYATOY_NOS_LON}"
         loc_name = "Мыс Святой Нос (Баренцево море, Мурманская область)"
     elif "култук" in q_lower:
@@ -352,12 +356,20 @@ async def fetch_dynamic_weather(query_text: str) -> str:
     elif "питер" in q_lower or "петербург" in q_lower:
         target_loc = "Санкт-Петербург"
         loc_name = "Санкт-Петербург"
+    # 2. Если пишет Паша (@tombarket) или вопрос про армейскую службу/вахту -> Святой Нос!
+    elif username == "tombarket" or first_name in ["павел", "паша"] or any(k in q_lower for k in ["вахт", "дежур", "армей", "служб", "сводк", "рапорт"]):
+        target_loc = f"{SVYATOY_NOS_LAT},{SVYATOY_NOS_LON}"
+        loc_name = "Мыс Святой Нос (Баренцево море, Мурманская область)"
     else:
-        # Попытка вытащить название города после предлогов
+        # 3. Поиск города после предлогов в тексте с фильтром стоп-слов
         match = re.search(r'(?:в|во|на|по|городе|город)\s+([а-яА-Яa-zA-Z0-9\-]+)', q_lower)
         if match:
             extracted = match.group(1).strip()
-            stop_words = ["утром", "вечером", "ночью", "день", "завтра", "сегодня", "понедельник", "вторник", "среду", "четверг", "пятницу", "субботу", "воскресенье"]
+            stop_words = {
+                "погоду", "погоде", "погодка", "погодку", "погодам", "делам", "пацански", 
+                "факту", "душе", "жизни", "утром", "вечером", "ночью", "день", "дням", "завтра", 
+                "сегодня", "понедельник", "вторник", "среду", "четверг", "пятницу", "субботу", "воскресенье"
+            }
             if extracted not in stop_words and len(extracted) > 2:
                 target_loc = extracted
                 loc_name = extracted.capitalize()
@@ -365,6 +377,7 @@ async def fetch_dynamic_weather(query_text: str) -> str:
                 target_loc = f"{KULTUK_LAT},{KULTUK_LON}"
                 loc_name = "Култук (Байкал)"
         else:
+            # 4. Дефолт для всех остальных (Захар, Илья и др.) -> Култук (Байкал)
             target_loc = f"{KULTUK_LAT},{KULTUK_LON}"
             loc_name = "Култук (Байкал)"
 
@@ -783,20 +796,36 @@ async def save_post_today():
 # АРМЕЙСКАЯ СВОДКА ДЛЯ ПАХИ (МЫС СВЯТОЙ НОС)
 # =====================================================
 
-def encode_army_phenomenon(weather_code: int, wind_gusts_ms: float = 0) -> tuple[str, str]:
-    if wind_gusts_ms >= 18.0 and weather_code in [61, 63, 65, 80, 81, 82, 95]:
+def encode_army_phenomenon(weather_code: int, wind_gusts_ms: float = 0, vis_meters: float = 20000) -> tuple[str, str]:
+    has_fog = (weather_code in [45, 48] or vis_meters <= 1000)
+    has_rain = weather_code in [61, 63, 65, 80, 81, 82]
+    has_drizzle = weather_code in [51, 53, 55]
+    has_snow = weather_code in [71, 73, 75, 85, 86]
+    has_thunder = weather_code == 95
+    has_squall = (wind_gusts_ms >= 18.0 and (has_rain or has_snow or has_thunder))
+
+    # Комбинации с туманом (по армейскому правилу Пахи)
+    if has_fog and has_rain:
+        return "06/08", "Туман с дождём"
+    if has_fog and has_drizzle:
+        return "06/07", "Туман с моросью"
+    if has_fog and has_snow:
+        return "06/09", "Туман со снегом"
+
+    # Одиночные явления
+    if has_squall:
         return "01", "Шквал"
-    if weather_code == 95:
+    if has_thunder:
         return "13", "Гроза"
-    if weather_code in [71, 73, 75, 85, 86]:
+    if has_snow:
         return "09", "Снег"
-    if weather_code in [61, 63, 65, 80, 81, 82]:
+    if has_rain:
         return "08", "Дождь"
-    if weather_code in [51, 53, 55]:
+    if has_drizzle:
         return "07", "Морось"
-    if weather_code in [45, 48]:
+    if has_fog:
         return "06", "Туман"
-    if weather_code in [1, 2, 3]:
+    if 1000 < vis_meters <= 4000:
         return "03", "Дымка"
     return "00", "Без особых явлений"
 
@@ -954,7 +983,7 @@ async def fetch_svyatoy_nos_army_weather() -> dict:
 
 
 def build_army_code_string(current: dict) -> str:
-    """Генерирует 10-значный шифр по метеоданным."""
+    """Генерирует шифр по метеоданным (с поддержкой 06/07 и 06/08)."""
     w_code = current.get("weather_code", 0)
     w_dir_deg = current.get("wind_direction_10m", 0)
     w_spd_ms = round(current.get("wind_speed_10m", 0))
@@ -962,15 +991,15 @@ def build_army_code_string(current: dict) -> str:
     temp = round(current.get("temperature_2m", 10))
     vis_m = current.get("visibility", 20000)
 
-    ph_code, _ = encode_army_phenomenon(w_code, w_gusts_ms)
+    ph_code, _ = encode_army_phenomenon(w_code, w_gusts_ms, vis_m)
     wdir_code, _ = encode_army_wind_dir(w_dir_deg)
     wspd_code = f"{max(0, min(99, w_spd_ms)):02d}"
     vis_code, _ = encode_army_visibility(vis_m)
     temp_code = f"{abs(temp):02d}"
 
-    # Если видимость <= 3 (5 каб и меньше), море не видно -> "XX"
+    # Если видимость <= 3 (5 каб и меньше), море не видно -> "хх"
     if int(vis_code) <= 3:
-        sea_code = "XX"
+        sea_code = "хх"
     else:
         sea_code, _ = encode_army_sea_state(w_spd_ms)
 
@@ -1225,14 +1254,14 @@ async def ask_wisdom(user_question: str, user: types.User | None = None) -> str:
     username_tag = f"@{user.username}" if user and user.username else user_name
     q_lower = user_question.lower()
 
-    # Если в вопросе спрашивают про погоду/ветер/градусы — динамически подтягиваем реальный прогноз для нужного места
+    # Если в вопросе спрашивают про погоду/ветер/градусы или пишут "поясни за погодку"
     weather_context = ""
-    if any(word in q_lower for word in ["погод", "ветер", "температур", "градус", "дожд", "снег", "утр", "завтр", "ночью", "днем", "прогноз", "жар", "холод"]):
-        forecast_data = await fetch_dynamic_weather(user_question)
+    if any(word in q_lower for word in ["погод", "ветер", "температур", "градус", "дожд", "снег", "туман", "утр", "завтр", "ночью", "днем", "прогноз", "жар", "холод"]):
+        forecast_data = await fetch_dynamic_weather(user_question, user)
         weather_context = (
             f"\n\n[РЕАЛЬНАЯ ТОЧНАЯ МЕТЕОСВОДКА ИЗ МЕТЕОСЛУЖБЫ]:\n"
             f"{forecast_data}\n"
-            f"СТРОГО ОБЯЗАТЕЛЬНО используй эти ТОЧНЫЕ цифры (температуру, ветер, осадки) для ответа! Не придумывай и не выдумывай градусы от себя!"
+            f"СТРОГО ОБЯЗАТЕЛЬНО используй эти ТОЧНЫЕ цифры (температуру, ветер, осадки) для ответа! Отвечай конкретно по той локации, которая указана в сводке (не приплетай другие города!)."
         )
 
     prompt = (
