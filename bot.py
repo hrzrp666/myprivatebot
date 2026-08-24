@@ -128,8 +128,9 @@ WISDOM_SYSTEM_INSTRUCTION = (
     "   - Паша (@tombarket) — служит в армии на МЫСЕ СВЯТОЙ НОС (Баренцево море, Кольский полуостров, Северный флот / Мурманская область). Это Заполярье, Крайний Север! Категорически ЗАПРЕЩЕНО говорить Паше про Байкал или Култук, если он прямо не спросил про них! Когда Паша спрашивает 'поясни за погодку' или про погоду — речь ВСЕГДА идёт про мыс Святой Нос.\n"
     "   - Илья (@Akishinov) — нефтяник. Любит выпендриваться деньгами, вахтами и статусом. С ним общайся ровно, НЕ подлизывайся, приземляй его добрыми подколами про выкачивание нефти, баррели, бабло или работу. Если Илья спрашивает 'кто лучше' или 'кто успешнее' — ставь его на место с иронией, напоминая про Захара и Пашку.\n"
     "   - Култук — это посёлок на Байкале (Иркутская область), где живут Захар и пацаны.\n"
-    "4. ЕСЛИ СПРАШИВАЮТ ПРО ПОГОДУ: Отвечай СТРОГО ПО ФАКТУ, используя предоставленные реальные данные метеослужбы (градусы, ветер, осадки). Ни в коем случае не придумывай температуру от себя и не путай города!\n"
-    "5. Ответы держи компактными — строго 2–3 ёмких и живых предложения."
+    "4. ПАМЯТЬ И ЛОГИКА ДИАЛОГА: Всегда внимательно смотри на предоставленную историю последних сообщений и на сообщение, на которое отвечаешь! Не противоречь своим предыдущим словам, держи нить разговора и понимай контекст подколов и вопросов.\n"
+    "5. ЕСЛИ СПРАШИВАЮТ ПРО ПОГОДУ: Отвечай СТРОГО ПО ФАКТУ, используя предоставленные реальные данные метеослужбы (градусы, ветер, осадки). Категорически запрещено выдумывать градусы из головы или путать локации!\n"
+    "6. Ответы держи компактными — строго 2–3 ёмких и живых предложения."
 )
 
 
@@ -1031,9 +1032,9 @@ async def start(
         "📜 <b>Мои возможности:</b>\n"
         "• Каждое утро в 09:00 — Мысль дня и погода\n"
         "• /code или /паха — Сводка (шифр) для Пахи на Святом Носе\n"
-        "• /question &lt;вопрос&gt; — Спросить мудреца\n"
         "• /summary — Краткая выжимка (что пропустили в чате)\n"
-        "• Каждое воскресенье в 20:00 — Итоги недели"
+        "• Каждое воскресенье в 20:00 — Итоги недели\n"
+        "• Общайся со мной просто по имени «Мяумяура» или отвечая на мои сообщения!"
     )
 
 
@@ -1068,36 +1069,6 @@ async def army_weather_cmd(message: types.Message):
     full_code = build_army_code_string(current)
 
     await message.reply(f"Погода Святой Нос: <code>{full_code}</code>")
-
-
-@dp.message(Command("question"))
-async def question_cmd(
-    message: types.Message
-):
-
-    args = message.text.split(maxsplit=1)
-    
-    question_text = ""
-    if len(args) > 1:
-        question_text = args[1].strip()
-    elif message.reply_to_message and message.reply_to_message.text:
-        question_text = message.reply_to_message.text.strip()
-
-    if not question_text:
-        await message.reply(
-            "🧙 Чтобы получить мудрость, задай вопрос после команды, например:\n"
-            "<code>/question В чём смысл жизни?</code>"
-        )
-        return
-
-    await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-
-    answer = await ask_wisdom(question_text, message.from_user)
-    
-    safe_answer = html.escape(answer)
-    await message.reply(
-        f"🧙 <b>Мудрец Мяумяура молвит:</b>\n\n{safe_answer}"
-    )
 
 
 @dp.message(Command("summary"))
@@ -1184,10 +1155,11 @@ async def collect(
         bot_username = bot_info.username.lower() if bot_info.username else ""
         is_addressed = "мяумяура" in message.text.lower() or (bot_username and f"@{bot_username}" in message.text.lower())
 
-        # 1. Прямой вызов — ответ сразу, без ожидания кулдауна
+        # 1. Прямой вызов — ответ сразу, передавая контекст реплая и недавней переписки
         if is_reply_to_bot or is_addressed:
             await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-            answer = await ask_wisdom(message.text, message.from_user)
+            reply_quote = message.reply_to_message.text if message.reply_to_message and message.reply_to_message.text else None
+            answer = await ask_wisdom(message.text, message.from_user, reply_quote)
             await message.reply(f"🧙 {html.escape(answer)}")
             return
 
@@ -1249,24 +1221,33 @@ async def call_gemini_safe(contents, config=None):
 # GEMINI FUNCTIONS
 # =====================================================
 
-async def ask_wisdom(user_question: str, user: types.User | None = None) -> str:
+async def ask_wisdom(user_question: str, user: types.User | None = None, reply_quote: str | None = None) -> str:
     user_name = user.first_name if user else "Участник"
     username_tag = f"@{user.username}" if user and user.username else user_name
     q_lower = user_question.lower()
 
-    # Если в вопросе спрашивают про погоду/ветер/градусы или пишут "поясни за погодку"
+    # Достаем последние 6 сообщений из чата, чтобы бот держал контекст и память диалога
+    recent_dialogue = await get_recent_messages(hours=1, limit=6)
+
+    # Проверяем тему погоды (в текущем вопросе или в сообщении, на которое ответили)
+    combined_query_check = q_lower + (" " + reply_quote.lower() if reply_quote else "")
     weather_context = ""
-    if any(word in q_lower for word in ["погод", "ветер", "температур", "градус", "дожд", "снег", "туман", "утр", "завтр", "ночью", "днем", "прогноз", "жар", "холод"]):
-        forecast_data = await fetch_dynamic_weather(user_question, user)
+    if any(word in combined_query_check for word in ["погод", "ветер", "температур", "градус", "дожд", "снег", "туман", "утр", "завтр", "ночью", "днем", "прогноз", "жар", "холод"]):
+        forecast_data = await fetch_dynamic_weather(user_question if any(w in q_lower for w in ["погод", "ветер", "температур", "градус", "дожд", "снег", "туман"]) else (reply_quote or user_question), user)
         weather_context = (
             f"\n\n[РЕАЛЬНАЯ ТОЧНАЯ МЕТЕОСВОДКА ИЗ МЕТЕОСЛУЖБЫ]:\n"
             f"{forecast_data}\n"
             f"СТРОГО ОБЯЗАТЕЛЬНО используй эти ТОЧНЫЕ цифры (температуру, ветер, осадки) для ответа! Отвечай конкретно по той локации, которая указана в сводке (не приплетай другие города!)."
         )
 
+    reply_context_str = f"\n[ПОЛЬЗОВАТЕЛЬ ОТВЕЧАЕТ НА ЭТУ РЕПЛИКУ]: '{reply_quote}'\n" if reply_quote else ""
+
     prompt = (
-        f'Тебе пишет {user_name} ({username_tag}): "{user_question}"{weather_context}\n'
-        'Ответь ему в своём пацанском стиле, помня роли каждого в банде (Захар — лучший кент, Паша — служит на Севере на Святом Носе в Баренцевом море, Илья — нефтяник для подколов). '
+        f"[ПОСЛЕДНИЕ СООБЩЕНИЯ В ЧАТЕ ДЛЯ ПАМЯТИ И КОНТЕКСТА]:\n{recent_dialogue}\n"
+        f"{reply_context_str}"
+        f"{weather_context}\n\n"
+        f'Тебе пишет {user_name} ({username_tag}): "{user_question}"\n'
+        'Ответь ему в своём пацанском стиле, строго соблюдая память диалога (понимай о чем шла речь выше, не противоречь себе). '
         'Никакой лести и подхалимажа! Отвечай уверенно, с юмором и строго по реальным фактам (2-3 предложения).'
     )
 
@@ -1274,7 +1255,7 @@ async def ask_wisdom(user_question: str, user: types.User | None = None) -> str:
         response = await call_gemini_safe(
             contents=prompt,
             config=genai_types.GenerateContentConfig(
-                temperature=0.7,
+                temperature=0.6,
                 system_instruction=WISDOM_SYSTEM_INSTRUCTION
             )
         )
