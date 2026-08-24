@@ -841,39 +841,50 @@ async def save_post_today():
 # АРМЕЙСКАЯ СВОДКА ДЛЯ ПАХИ (МЫС СВЯТОЙ НОС)
 # =====================================================
 
-def encode_army_phenomenon(weather_code: int, wind_gusts_ms: float = 0, vis_meters: float = 20000) -> tuple[str, str]:
-    # Туман определяется кодом погоды (45, 48) или ограниченной видимостью (<= 2000 м / 1 миля на мысе)
-    has_fog = (weather_code in [45, 48] or vis_meters <= 2000)
+def encode_army_phenomenon(weather_code: int, wind_gusts_ms: float = 0, vis_meters: float = 20000, humidity: float = 0) -> tuple[str, str, float]:
+    """
+    Определяет явление по таблице Пахи:
+    - При влажности >= 88% на мысе Святой Нос всегда стоит плотный морской туман (06).
+    - Если осадков и тумана нет — в армейском рапорте пишется 03 (дымка).
+    Возвращает: (код явления, описание, скорректированная видимость)
+    """
+    is_foggy = (weather_code in [45, 48] or vis_meters <= 3000 or humidity >= 88)
     has_rain = weather_code in [61, 63, 65, 80, 81, 82]
     has_drizzle = weather_code in [51, 53, 55]
     has_snow = weather_code in [71, 73, 75, 85, 86]
     has_thunder = weather_code == 95
     has_squall = (wind_gusts_ms >= 18.0 and (has_rain or has_snow or has_thunder))
 
-    # Комбинации с туманом (по армейскому правилу Пахи)
-    if has_fog and has_rain:
-        return "06/08", "Туман с дождём"
-    if has_fog and has_drizzle:
-        return "06/07", "Туман с моросью"
-    if has_fog and has_snow:
-        return "06/09", "Туман со снегом"
+    # Корректировка видимости в морском тумане
+    actual_vis = vis_meters
+    if is_foggy:
+        if actual_vis > 2000:
+            actual_vis = 800 if humidity >= 93 else 1500
+
+    # Комбинации с туманом
+    if is_foggy and has_rain:
+        return "06/08", "Туман с дождём", actual_vis
+    if is_foggy and has_drizzle:
+        return "06/07", "Туман с моросью", actual_vis
+    if is_foggy and has_snow:
+        return "06/09", "Туман со снегом", actual_vis
 
     # Одиночные явления
     if has_squall:
-        return "01", "Шквал"
+        return "01", "Шквал", actual_vis
     if has_thunder:
-        return "13", "Гроза"
+        return "13", "Гроза", actual_vis
     if has_snow:
-        return "09", "Снег"
+        return "09", "Снег", actual_vis
     if has_rain:
-        return "08", "Дождь"
+        return "08", "Дождь", actual_vis
     if has_drizzle:
-        return "07", "Морось"
-    if has_fog:
-        return "06", "Туман"
+        return "07", "Морось", actual_vis
+    if is_foggy:
+        return "06", "Туман", actual_vis
 
-    # ЖЕСТКОЕ ПРАВИЛО ПАХИ: если осадков и тумана нет — в армейском рапорте ВСЕГДА пишется 03 (дымка)!
-    return "03", "Дымка"
+    # Если осадков и тумана нет — по регламенту пишется 03 (дымка)
+    return "03", "Дымка", actual_vis
 
 
 def encode_army_wind_dir(degrees: float) -> tuple[str, str]:
@@ -957,6 +968,7 @@ async def fetch_svyatoy_nos_army_weather() -> dict:
                 wind_ms = wind_kmh / 3.6
                 wind_dir = float(cur.get("winddirDegree", 90))
                 vis_km = float(cur.get("visibility", 10))
+                humidity = float(cur.get("humidity", 90))
                 w_desc_code = cur.get("weatherCode", "113")
                 
                 # Маппинг погоды в коды
@@ -981,7 +993,8 @@ async def fetch_svyatoy_nos_army_weather() -> dict:
                     "wind_direction_10m": wind_dir,
                     "wind_gusts_10m": wind_ms * 1.25,
                     "weather_code": w_code,
-                    "visibility": vis_km * 1000
+                    "visibility": vis_km * 1000,
+                    "humidity": humidity
                 }
                 set_cached_weather("svyatoy_nos_army", parsed)
                 logging.info("Погода Святого Носа успешно получена через wttr.in")
@@ -993,7 +1006,7 @@ async def fetch_svyatoy_nos_army_weather() -> dict:
     url_om = (
         f"https://api.open-meteo.com/v1/forecast"
         f"?latitude={SVYATOY_NOS_LAT}&longitude={SVYATOY_NOS_LON}"
-        f"&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m"
+        f"&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m"
         f"&hourly=visibility"
         f"&wind_speed_unit=ms"
         f"&forecast_days=1"
@@ -1007,6 +1020,7 @@ async def fetch_svyatoy_nos_army_weather() -> dict:
                 hourly = data.get("hourly", {})
                 vis_list = hourly.get("visibility", [])
                 current["visibility"] = vis_list[0] if vis_list else 20000
+                current["humidity"] = current.get("relative_humidity_2m", 90)
                 set_cached_weather("svyatoy_nos_army", current)
                 return current
     except Exception as e:
@@ -1024,7 +1038,8 @@ async def fetch_svyatoy_nos_army_weather() -> dict:
         "wind_direction_10m": 90.0,
         "wind_gusts_10m": 5.0,
         "weather_code": 3,
-        "visibility": 10000
+        "visibility": 10000,
+        "humidity": 92.0
     }
 
 
@@ -1036,11 +1051,12 @@ def build_army_code_string(current: dict) -> str:
     w_gusts_ms = round(current.get("wind_gusts_10m", 0))
     temp = round(current.get("temperature_2m", 10))
     vis_m = current.get("visibility", 20000)
+    humidity = current.get("humidity", 90.0)
 
-    ph_code, _ = encode_army_phenomenon(w_code, w_gusts_ms, vis_m)
+    ph_code, _, actual_vis = encode_army_phenomenon(w_code, w_gusts_ms, vis_m, humidity)
     wdir_code, _ = encode_army_wind_dir(w_dir_deg)
     wspd_code = f"{max(0, min(99, w_spd_ms)):02d}"
-    vis_code, _ = encode_army_visibility(vis_m)
+    vis_code, _ = encode_army_visibility(actual_vis)
     temp_code = f"{abs(temp):02d}"
 
     # Если видимость <= 3 (5 каб и меньше), море не видно -> "хх"
