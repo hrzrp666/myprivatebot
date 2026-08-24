@@ -264,14 +264,22 @@ class DailyPostSchema(BaseModel):
 # =====================================================
 
 async def text_to_speech_bytes(text: str) -> bytes | None:
-    """Конвертирует текст ответа в естественный русский голос через Edge-TTS."""
+    """Конвертирует текст ответа в низкий ордынский бас через Edge-TTS."""
     try:
         clean_text = re.sub(r'<[^>]+>', '', text)
         clean_text = re.sub(r'[^\w\s.,!?-]', '', clean_text)
         if not clean_text.strip():
             return None
 
-        communicate = edge_tts.Communicate(clean_text, VOICE_ACTOR)
+        # pitch="-25Hz" делает голос глубоким и басовитым
+        # rate="-8%" делает речь размеренной и суровой
+        communicate = edge_tts.Communicate(
+            clean_text, 
+            VOICE_ACTOR,
+            pitch="-25Hz",
+            rate="-8%"
+        )
+        
         audio_bytes = bytearray()
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
