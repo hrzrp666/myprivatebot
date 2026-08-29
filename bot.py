@@ -103,27 +103,6 @@ logging.getLogger("google_genai").setLevel(logging.ERROR)
 logging.getLogger("google.genai").setLevel(logging.ERROR)
 
 
-# =====================================================
-# CONFIG FOR NEW FEATURES
-# =====================================================
-
-# Порог опасного ветра (в м/с)
-WIND_WARNING_THRESHOLD = 15.0
-
-# Статусы сервисов для Uptime-мониторинга
-SERVICES_STATUS = {
-    "Telegram API": True,
-    "Steam": True,
-    "VK": True
-}
-
-TARGET_SERVICES = {
-    "Telegram API": f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe",
-    "Steam": "https://store.steampowered.com",
-    "VK": "https://vk.com"
-}
-
-
 WISDOM_SYSTEM_INSTRUCTION = (
     "Ты — Мудрец Мяумяура, свой пацан, надёжный, рассудительный, умный и с хорошим чувством юмора старший товарищ в компании друзей.\n"
     "ПРАВИЛА ПОВЕДЕНИЯ И ХАРАКТЕРА:\n"
@@ -479,95 +458,6 @@ async def fetch_dynamic_weather(query_text: str, user: types.User | None = None)
 
 
 # =====================================================
-# MONITORS & ALERTS
-# =====================================================
-
-async def check_storm_warnings():
-    """Проверка экстремальной погоды (шторм, порывы ветра) для Култука и Святого Носа."""
-    locations = [
-        ("Култук", KULTUK_LAT, KULTUK_LON),
-        ("Святой Нос", SVYATOY_NOS_LAT, SVYATOY_NOS_LON)
-    ]
-    
-    alerts = []
-    session = await get_http_session()
-    headers = {"User-Agent": "TelegramStormBot/2.0 (Mozilla/5.0)"}
-    
-    for name, lat, lon in locations:
-        url = (
-            f"https://api.open-meteo.com/v1/forecast"
-            f"?latitude={lat}&longitude={lon}"
-            f"&current=wind_speed_10m,wind_gusts_10m,weather_code"
-            f"&timezone=Asia%2FIrkutsk"
-        )
-        try:
-            async with session.get(url, headers=headers, timeout=10) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    current = data.get("current", {})
-                    
-                    wind_speed = current.get("wind_speed_10m", 0) / 3.6  # перевод км/ч в м/с
-                    wind_gusts = current.get("wind_gusts_10m", 0) / 3.6
-                    
-                    if wind_speed >= WIND_WARNING_THRESHOLD or wind_gusts >= WIND_WARNING_THRESHOLD:
-                        alerts.append(
-                            f"⚠️ <b>{name}:</b> Штормовой ветер! "
-                            f"Скорость: <b>{round(wind_speed, 1)} м/с</b> "
-                            f"(порывы до <b>{round(wind_gusts, 1)} м/с</b>)"
-                        )
-        except Exception as e:
-            logging.error(f"Ошибка проверки шторма для {name}: {e}")
-            
-    if alerts:
-        text = "🚨 <b>ШТОРМОВОЕ ПРЕДУПРЕЖДЕНИЕ:</b>\n\n" + "\n".join(alerts)
-        try:
-            await bot.send_message(CHAT_ID, text)
-        except Exception as e:
-            logging.error(f"Не удалось отправить штормовое предупреждение: {e}")
-
-
-async def check_uptime():
-    """Проверка доступности Steam, Telegram и VK."""
-    global SERVICES_STATUS
-    
-    session = await get_http_session()
-    for name, url in TARGET_SERVICES.items():
-        is_up = False
-        try:
-            async with session.get(url, timeout=5) as resp:
-                if resp.status < 400:
-                    is_up = True
-        except Exception:
-            is_up = False
-
-        previous_status = SERVICES_STATUS.get(name, True)
-        
-        if is_up != previous_status:
-            SERVICES_STATUS[name] = is_up
-            if not is_up:
-                if name == "Telegram API":
-                    logging.warning("Telegram API недоступен! Отправка сообщения в Telegram пропущена.")
-                    continue
-                try:
-                    await bot.send_message(
-                        CHAT_ID, 
-                        f"🔴 <b>Сбой сервиса!</b>\n{name} недоступен или не отвечает."
-                    )
-                except Exception as e:
-                    logging.error(f"Ошибка отправки уведомления о падении {name}: {e}")
-                logging.warning(f"Сервис {name} упал!")
-            else:
-                try:
-                    await bot.send_message(
-                        CHAT_ID, 
-                        f"🟢 <b>Сервис восстановлен!</b>\n{name} снова работает в штатном режиме."
-                    )
-                except Exception as e:
-                    logging.error(f"Ошибка отправки уведомления о восстановлении {name}: {e}")
-                logging.info(f"Сервис {name} поднялся!")
-
-
-# =====================================================
 # DATABASE
 # =====================================================
 
@@ -866,75 +756,46 @@ def parse_wind_dir_from_text(dir_text: str) -> str:
 def encode_army_phenomenon(
     weather_code: int = 0,
     wind_gusts_ms: float = 0,
-    vis_meters: float = 20000,
-    humidity: float = 0,
-    precip_mm: float = 0.0,
     raw_text: str = ""
-) -> tuple[str, str, float]:
+) -> tuple[str, str]:
     """
-    Калибровка явлений и видимости под мыс Святой Нос (Метеоинфо / Таблица Пахи):
-    - При влажности >= 94% ставит плотный туман 06 (видимость 2 - 2-3 каб / ~400м).
-    - При влажности 88-93% ставит туман 06 (видимость 3 - 5 каб / ~850м).
-    - Дождь (08) или морось (07) только при реальных осадках (precip_mm >= 0.2).
+    Определяет явление строго по фактическим данным метеостанции:
+    - Без выдумывания тумана по влажности.
     - Если осадков и тумана нет — в армейском рапорте пишется 03 (дымка).
     """
     txt = raw_text.lower()
-    
-    # 1. Анализ тумана
-    is_dense_fog = (
-        weather_code in [45, 48] or 
-        humidity >= 94.0 or 
-        vis_meters <= 1000 or 
-        "густой туман" in txt or 
-        ("туман" in txt and (humidity >= 92.0 or vis_meters <= 1500))
-    )
-    is_light_fog = (
-        (88.0 <= humidity < 94.0) or 
-        (1000 < vis_meters <= 3000) or 
-        ("туман" in txt and not is_dense_fog)
-    )
-    is_foggy = is_dense_fog or is_light_fog
 
-    # 2. Анализ осадков
-    has_real_precip = precip_mm >= 0.2 or any(k in txt for k in ["ливнев", "дождь", "морось", "снег"])
-    has_rain = has_real_precip and (weather_code in [61, 63, 65, 80, 81, 82] or "дождь" in txt)
-    has_drizzle = has_real_precip and (weather_code in [51, 53, 55] or "морось" in txt)
-    has_snow = has_real_precip and (weather_code in [71, 73, 75, 85, 86] or "снег" in txt)
-    has_thunder = (weather_code == 95 or "гроза" in txt)
-    has_squall = (wind_gusts_ms >= 18.0 and (has_rain or has_snow or has_thunder)) or ("шквал" in txt)
+    has_fog = (weather_code in [45, 48]) or ("туман" in txt)
+    has_rain = (weather_code in [61, 63, 65, 80, 81, 82]) or ("дождь" in txt) or ("ливень" in txt)
+    has_drizzle = (weather_code in [51, 53, 55]) or ("морось" in txt)
+    has_snow = (weather_code in [71, 73, 75, 85, 86]) or ("снег" in txt)
+    has_thunder = (weather_code == 95) or ("гроза" in txt)
+    has_squall = ("шквал" in txt) or (wind_gusts_ms >= 18.0 and (has_rain or has_snow or has_thunder))
 
-    # 3. Точная корректировка видимости в тумане под рельеф мыса
-    if is_dense_fog:
-        actual_vis = 400.0  # Код видимости 2 (2-3 кабельтова)
-    elif is_light_fog:
-        actual_vis = 850.0  # Код видимости 3 (5 кабельтовых)
-    else:
-        actual_vis = vis_meters
+    # Комбинации с туманом
+    if has_fog and has_rain:
+        return "06/08", "Туман с дождём"
+    if has_fog and has_drizzle:
+        return "06/07", "Туман с моросью"
+    if has_fog and has_snow:
+        return "06/09", "Туман со снегом"
 
-    # 4. Комбинации с туманом (только при реальных осадках)
-    if is_foggy and has_rain:
-        return "06/08", "Туман с дождём", actual_vis
-    if is_foggy and has_drizzle:
-        return "06/07", "Туман с моросью", actual_vis
-    if is_foggy and has_snow:
-        return "06/09", "Туман со снегом", actual_vis
-
-    # 5. Одиночные явления
+    # Одиночные явления
     if has_squall:
-        return "01", "Шквал", actual_vis
+        return "01", "Шквал"
     if has_thunder:
-        return "13", "Гроза", actual_vis
+        return "13", "Гроза"
     if has_snow:
-        return "09", "Снег", actual_vis
+        return "09", "Снег"
     if has_rain:
-        return "08", "Дождь", actual_vis
+        return "08", "Дождь"
     if has_drizzle:
-        return "07", "Морось", actual_vis
-    if is_foggy:
-        return "06", "Туман", actual_vis
+        return "07", "Морось"
+    if has_fog:
+        return "06", "Туман"
 
     # Если осадков и тумана нет — по регламенту пишется 03 (дымка)
-    return "03", "Дымка", actual_vis
+    return "03", "Дымка"
 
 
 def encode_army_wind_dir(degrees: float) -> tuple[str, str]:
@@ -1032,7 +893,7 @@ def parse_meteoinfo_html(html_content: str) -> dict | None:
         if w_gust_m:
             data["wind_gusts_10m"] = float(w_gust_m.group(1).replace(',', '.'))
 
-        # 6. Горизонтальная видимость
+        # 6. Горизонтальная видимость (строго берем реальное значение сайта)
         vis_m = re.search(r'Горизонтальная видимость[^\d]*(\d+(?:[.,]\d+)?)', clean, re.IGNORECASE)
         if vis_m:
             v_val = float(vis_m.group(1).replace(',', '.'))
@@ -1120,7 +981,8 @@ async def fetch_svyatoy_nos_army_weather() -> dict:
                     "weather_code": w_code,
                     "visibility": vis_km * 1000,
                     "humidity": humidity,
-                    "precip_mm": precip_mm
+                    "precip_mm": precip_mm,
+                    "raw_text": ""
                 }
                 set_cached_weather("svyatoy_nos_army", parsed)
                 logging.info("Погода Святого Носа успешно получена через wttr.in")
@@ -1148,6 +1010,7 @@ async def fetch_svyatoy_nos_army_weather() -> dict:
                 current["visibility"] = vis_list[0] if vis_list else 20000
                 current["humidity"] = current.get("relative_humidity_2m", 90)
                 current["precip_mm"] = current.get("precipitation", 0.0)
+                current["raw_text"] = ""
                 set_cached_weather("svyatoy_nos_army", current)
                 return current
     except Exception as e:
@@ -1167,19 +1030,18 @@ async def fetch_svyatoy_nos_army_weather() -> dict:
         "weather_code": 3,
         "visibility": 10000,
         "humidity": 92.0,
-        "precip_mm": 0.0
+        "precip_mm": 0.0,
+        "raw_text": ""
     }
 
 
 def build_army_code_string(current: dict) -> str:
-    """Генерирует шифр по метеоданным по регламенту вахты Пахи."""
+    """Генерирует шифр по фактическим метеоданным сайта без искусственных изменений."""
     w_code = current.get("weather_code", 0)
     w_spd_ms = round(current.get("wind_speed_10m", 0))
     w_gusts_ms = round(current.get("wind_gusts_10m", 0))
     temp = round(current.get("temperature_2m", 10))
     vis_m = current.get("visibility", 20000)
-    humidity = current.get("humidity", 90.0)
-    precip_mm = current.get("precip_mm", 0.0)
     raw_text = current.get("raw_text", "")
 
     # 1. Направление ветра
@@ -1189,19 +1051,16 @@ def build_army_code_string(current: dict) -> str:
         w_dir_deg = current.get("wind_direction_10m", 0)
         wdir_code, _ = encode_army_wind_dir(w_dir_deg)
 
-    # 2. Явление и откалиброванная видимость
-    ph_code, _, actual_vis = encode_army_phenomenon(
+    # 2. Явление (строго по факту с сайта)
+    ph_code, _ = encode_army_phenomenon(
         weather_code=w_code,
         wind_gusts_ms=w_gusts_ms,
-        vis_meters=vis_m,
-        humidity=humidity,
-        precip_mm=precip_mm,
         raw_text=raw_text
     )
 
-    # 3. Скорость, видимость, температура
+    # 3. Скорость, видимость, температура (строго по реальным данным сайта)
     wspd_code = f"{max(0, min(99, w_spd_ms)):02d}"
-    vis_code, _ = encode_army_visibility(actual_vis)
+    vis_code, _ = encode_army_visibility(vis_m)
     temp_code = f"{abs(temp):02d}"
 
     # 4. Волнение моря: если видимость <= 3 (5 каб и меньше), море не видно -> "хх"
@@ -1541,7 +1400,7 @@ async def generate_summary() -> str:
     chat = await get_recent_messages(hours=12, limit=200)
 
     prompt = f"""
-Посмотри переписку друзей за последнее время и сдежать очень краткую, емкую выжимку в 3-4 буллитах (главные темы).
+Посмотри переписку друзей за последнее время и сделай очень краткую, емкую выжимку в 3-4 буллитах (главные темы).
 
 Переписка (формат [Имя Автора]: текст):
 {chat}
@@ -1717,100 +1576,46 @@ async def send_weekly_digest():
 
 def setup_scheduler():
 
-
     # Каждый день 09:00 Иркутск — Мысль дня и погода
     scheduler.add_job(
-
         create_daily_post,
-
         "cron",
-
         hour=9,
-
         minute=0,
-
         kwargs={
             "force": False
         },
-
         id="daily_post",
-
         replace_existing=True,
-
         misfire_grace_time=3600,
-
         coalesce=True
-
     )
-
 
     # Воскресенье 20:00 Иркутск — Итоги недели
     scheduler.add_job(
-
         send_weekly_digest,
-
         "cron",
-
         day_of_week="sun",
-
         hour=20,
-
         minute=0,
-
         id="weekly_digest",
-
         replace_existing=True,
-
         misfire_grace_time=3600,
-
         coalesce=True
-
     )
-
 
     # Очистка базы раз в неделю (Воскресенье 04:00 Иркутск)
     scheduler.add_job(
-
         clear_old_messages,
-
         "cron",
-
         day_of_week="sun",
-
         hour=4,
-
         minute=0,
-
         id="database_cleanup",
-
         replace_existing=True,
-
         misfire_grace_time=3600,
-
         coalesce=True
-
     )
-
-
-    # Проверка Uptime (Steam, TG, VK) каждые 5 минут
-    scheduler.add_job(
-        check_uptime,
-        "interval",
-        minutes=5,
-        id="check_uptime",
-        replace_existing=True
-    )
-
-
-    # Проверка штормовых предупреждений каждые 30 минут
-    scheduler.add_job(
-        check_storm_warnings,
-        "interval",
-        minutes=30,
-        id="check_storm",
-        replace_existing=True
-    )
-
 
     # Авто-сводка для Пахи: с 20:00 до 08:00 по МСК каждые 2 часа в :00
     scheduler.add_job(
@@ -1825,15 +1630,11 @@ def setup_scheduler():
         coalesce=True
     )
 
-
-
     scheduler.start()
-
 
     logging.info(
         "Планировщик запущен: Иркутск 09:00 (daily), Вс 20:00 (weekly), МСК 20:00-08:00 (Паха каждые 2ч)"
     )
-
 
 
 # =====================================================
