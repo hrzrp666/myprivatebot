@@ -757,21 +757,22 @@ def parse_wind_dir_from_text(dir_text: str) -> str:
 def encode_army_phenomenon(
     weather_code: int = 0,
     wind_gusts_ms: float = 0,
-    raw_text: str = ""
+    vis_meters: float = 20000,
+    precip_mm: float = 0.0
 ) -> tuple[str, str]:
     """
-    Определяет явление строго по фактическим данным метеостанции:
-    - Без выдумывания тумана по влажности.
-    - Если осадков и тумана нет — в армейском рапорте пишется 03 (дымка).
+    Определяет явление погоды по независимому синоптическому радару:
+    - Туман (06) ТОЛЬКО при метеорологическом коде тумана (45, 48) И видимости <= 1000 метров.
+    - Дождь / морось / снег при соответствующих кодах и осадках.
+    - Если явлений нет — по армейскому регламенту всегда пишется 03 (дымка).
     """
-    txt = raw_text.lower()
-
-    has_fog = (weather_code in [45, 48]) or ("туман" in txt)
-    has_rain = (weather_code in [61, 63, 65, 80, 81, 82]) or ("дождь" in txt) or ("ливень" in txt)
-    has_drizzle = (weather_code in [51, 53, 55]) or ("морось" in txt)
-    has_snow = (weather_code in [71, 73, 75, 85, 86]) or ("снег" in txt)
-    has_thunder = (weather_code == 95) or ("гроза" in txt)
-    has_squall = ("шквал" in txt) or (wind_gusts_ms >= 18.0 and (has_rain or has_snow or has_thunder))
+    # Туман возможен только если видимость реально упала до 1 км и ниже
+    has_fog = (weather_code in [45, 48]) and (vis_meters <= 1000)
+    has_rain = (weather_code in [61, 63, 65, 80, 81, 82]) or (precip_mm >= 0.2 and weather_code not in [71, 73, 75, 85, 86])
+    has_drizzle = (weather_code in [51, 53, 55])
+    has_snow = (weather_code in [71, 73, 75, 85, 86])
+    has_thunder = (weather_code == 95)
+    has_squall = (wind_gusts_ms >= 18.0 and (has_rain or has_snow or has_thunder))
 
     # Комбинации с туманом
     if has_fog and has_rain:
@@ -860,9 +861,13 @@ def encode_army_sea_state(wind_speed_ms: float) -> tuple[str, str]:
 
 
 def parse_meteoinfo_html(html_content: str) -> dict | None:
-    """Парсит официальную страницу станции Святой Нос на meteoinfo.ru."""
+    """Парсит показатели фактической погоды с метеостанции meteoinfo.ru."""
     try:
-        clean = re.sub(r'<[^>]+>', ' ', html_content)
+        # Изолируем только таблицу фактических измерений
+        table_match = re.search(r'<table[^>]*>(.*?)</table>', html_content, re.DOTALL | re.IGNORECASE)
+        table_html = table_match.group(1) if table_match else html_content
+
+        clean = re.sub(r'<[^>]+>', ' ', table_html)
         clean = clean.replace('&deg;', '°').replace('&nbsp;', ' ')
         clean = re.sub(r'\s+', ' ', clean)
 
@@ -904,8 +909,8 @@ def parse_meteoinfo_html(html_content: str) -> dict | None:
         precip_m = re.search(r'Осадки за \d+ часов[^\d]*(\d+(?:[.,]\d+)?)', clean, re.IGNORECASE)
         if precip_m:
             data["precip_mm"] = float(precip_m.group(1).replace(',', '.'))
-
-        data["raw_text"] = clean.lower()
+        else:
+            data["precip_mm"] = 0.0
 
         if "temperature_2m" in data and "wind_speed_10m" in data:
             return data
@@ -914,12 +919,32 @@ def parse_meteoinfo_html(html_content: str) -> dict | None:
     return None
 
 
+async def fetch_radar_phenomenon_code() -> int:
+    """Запрашивает текущий синоптический WMO код явления с метеорадара Open-Meteo."""
+    url_radar = (
+        f"https://api.open-meteo.com/v1/forecast"
+        f"?latitude={SVYATOY_NOS_LAT}&longitude={SVYATOY_NOS_LON}"
+        f"&current=weather_code"
+        f"&timezone=Europe%2FMoscow"
+    )
+    try:
+        session = await get_http_session()
+        headers = {"User-Agent": "Mozilla/5.0"}
+        async with session.get(url_radar, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return int(data.get("current", {}).get("weather_code", 0))
+    except Exception as e:
+        logging.warning(f"Ошибка получения кода явления с радара: {e}")
+    return 0
+
+
 async def fetch_svyatoy_nos_army_weather() -> dict:
     """
     Получает актуальные метеоданные Святого Носа:
-    1. Приоритет: meteoinfo.ru (Официальный Росгидромет / Станция Святой Нос)
-    2. Резерв 1: wttr.in
-    3. Резерв 2: Open-Meteo
+    1. Все метрики: meteoinfo.ru (Официальный Росгидромет / Станция Святой Нос)
+    2. Явления: Open-Meteo WMO Радар
+    3. Резервные каналы при недоступности Росгидромета: wttr.in и Open-Meteo
     """
     cached = get_cached_weather("svyatoy_nos_army")
     if cached:
@@ -928,19 +953,24 @@ async def fetch_svyatoy_nos_army_weather() -> dict:
     session = await get_http_session()
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"}
 
-    # 1. ПРИОРИТЕТ: meteoinfo.ru (Росгидромет)
+    # 1. Запрашиваем официальную метеостанцию meteoinfo.ru и радар параллельно
     url_meteoinfo = "https://meteoinfo.ru/pogoda/russia/murmansk-area/svjatoi-nos"
     try:
-        async with session.get(url_meteoinfo, headers=headers, timeout=aiohttp.ClientTimeout(total=6)) as resp:
-            if resp.status == 200:
-                html_body = await resp.text()
-                parsed_meteoinfo = parse_meteoinfo_html(html_body)
-                if parsed_meteoinfo:
-                    set_cached_weather("svyatoy_nos_army", parsed_meteoinfo)
-                    logging.info("Погода Святого Носа успешно получена с meteoinfo.ru (Росгидромет)")
-                    return parsed_meteoinfo
+        meteoinfo_task = session.get(url_meteoinfo, headers=headers, timeout=aiohttp.ClientTimeout(total=6))
+        radar_task = fetch_radar_phenomenon_code()
+        
+        resp, radar_code = await asyncio.gather(meteoinfo_task, radar_task, return_exceptions=True)
+        
+        if not isinstance(resp, Exception) and resp.status == 200:
+            html_body = await resp.text()
+            parsed_meteoinfo = parse_meteoinfo_html(html_body)
+            if parsed_meteoinfo:
+                parsed_meteoinfo["weather_code"] = radar_code if isinstance(radar_code, int) else 0
+                set_cached_weather("svyatoy_nos_army", parsed_meteoinfo)
+                logging.info("Погода Святого Носа получена: метрики с meteoinfo.ru, явление с радара")
+                return parsed_meteoinfo
     except Exception as e:
-        logging.warning(f"meteoinfo.ru недоступен ({e}). Переключаюсь на wttr.in...")
+        logging.warning(f"meteoinfo.ru недоступен ({e}). Переключаюсь на резервные источники...")
 
     # 2. РЕЗЕРВ 1: wttr.in
     url_wttr = f"https://wttr.in/{SVYATOY_NOS_LAT},{SVYATOY_NOS_LON}?format=j1"
@@ -958,7 +988,7 @@ async def fetch_svyatoy_nos_army_weather() -> dict:
                 precip_mm = float(cur.get("precipMM", 0.0))
                 w_desc_code = cur.get("weatherCode", "113")
 
-                # Маппинг погоды в коды
+                # Маппинг погоды в коды (без ложного тумана на 143)
                 w_code = 0
                 wc = int(w_desc_code) if str(w_desc_code).isdigit() else 113
                 if wc in [386, 389, 392, 395]:
@@ -967,7 +997,7 @@ async def fetch_svyatoy_nos_army_weather() -> dict:
                     w_code = 71
                 elif wc in [176, 263, 266, 293, 296, 299, 302, 305, 308, 353, 356, 359]:
                     w_code = 61
-                elif wc in [143, 248, 260]:
+                elif wc in [248, 260]:
                     w_code = 45
                 elif wc in [119, 122]:
                     w_code = 3
@@ -982,11 +1012,10 @@ async def fetch_svyatoy_nos_army_weather() -> dict:
                     "weather_code": w_code,
                     "visibility": vis_km * 1000,
                     "humidity": humidity,
-                    "precip_mm": precip_mm,
-                    "raw_text": ""
+                    "precip_mm": precip_mm
                 }
                 set_cached_weather("svyatoy_nos_army", parsed)
-                logging.info("Погода Святого Носа успешно получена через wttr.in")
+                logging.info("Погода Святого Носа получена через wttr.in (резерв)")
                 return parsed
     except Exception as e:
         logging.warning(f"wttr.in ошибка ({e}). Пробую Open-Meteo...")
@@ -1011,7 +1040,6 @@ async def fetch_svyatoy_nos_army_weather() -> dict:
                 current["visibility"] = vis_list[0] if vis_list else 20000
                 current["humidity"] = current.get("relative_humidity_2m", 90)
                 current["precip_mm"] = current.get("precipitation", 0.0)
-                current["raw_text"] = ""
                 set_cached_weather("svyatoy_nos_army", current)
                 return current
     except Exception as e:
@@ -1031,8 +1059,7 @@ async def fetch_svyatoy_nos_army_weather() -> dict:
         "weather_code": 3,
         "visibility": 10000,
         "humidity": 92.0,
-        "precip_mm": 0.0,
-        "raw_text": ""
+        "precip_mm": 0.0
     }
 
 
@@ -1043,7 +1070,7 @@ def build_army_code_string(current: dict) -> str:
     w_gusts_ms = round(current.get("wind_gusts_10m", 0))
     temp = round(current.get("temperature_2m", 10))
     vis_m = current.get("visibility", 20000)
-    raw_text = current.get("raw_text", "")
+    precip_mm = current.get("precip_mm", 0.0)
 
     # 1. Направление ветра
     if "wind_dir_code" in current:
@@ -1052,11 +1079,12 @@ def build_army_code_string(current: dict) -> str:
         w_dir_deg = current.get("wind_direction_10m", 0)
         wdir_code, _ = encode_army_wind_dir(w_dir_deg)
 
-    # 2. Явление (строго по факту с сайта)
+    # 2. Явление (радар + валидация видимостью)
     ph_code, _ = encode_army_phenomenon(
         weather_code=w_code,
         wind_gusts_ms=w_gusts_ms,
-        raw_text=raw_text
+        vis_meters=vis_m,
+        precip_mm=precip_mm
     )
 
     # 3. Скорость, видимость, температура (строго по реальным данным сайта)
