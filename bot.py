@@ -1,5 +1,6 @@
 from aiohttp import web 
 import asyncio
+import io
 import logging
 import os
 import json
@@ -14,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction
 from aiogram.filters import Command
@@ -1084,178 +1085,6 @@ async def send_auto_army_weather():
 
 
 # =====================================================
-# COMMANDS
-# =====================================================
-
-@dp.message(Command("start"))
-async def start(
-    message: types.Message
-):
-
-    await message.answer(
-        "🧙 Мудрец Мяумяура запущен.\n\n"
-        "📜 <b>Мои возможности:</b>\n"
-        "• Каждое утро в 09:00 — Мысль дня и погода\n"
-        "• /code или /паха — Сводка (шифр) для Пахи на Святом Носе\n"
-        "• /summary — Краткая выжимка (что пропустили в чате)\n"
-        "• Каждое воскресенье в 20:00 — Итоги недели\n"
-        "• Общайся со мной просто по имени «Мяумяура» или отвечая на мои сообщения!"
-    )
-
-
-
-@dp.message(Command("test"))
-async def test(
-    message: types.Message
-):
-
-    if ADMIN_ID and str(message.from_user.id) != str(ADMIN_ID):
-        await message.reply("🧙 Только хранитель знаний (администратор) может вызывать это испытание.")
-        return
-
-    await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-
-    await message.answer(
-        "🧠 Создаю тестовую мысль..."
-    )
-
-
-    await create_daily_post(
-        force=True
-    )
-
-
-@dp.message(Command("code", "paha", "svodka", "погода", "сводка", "код", "паха"))
-async def army_weather_cmd(message: types.Message):
-    """Генератор армейского кода для вахты Пахи на Святом Носе."""
-    await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-
-    current = await fetch_svyatoy_nos_army_weather()
-    full_code = build_army_code_string(current)
-
-    await message.reply(f"Погода Святой Нос: <code>{full_code}</code>")
-
-
-@dp.message(Command("summary"))
-async def summary_cmd(
-    message: types.Message
-):
-    """Краткая выжимка того, что произошло в чате за 12 часов."""
-    await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-
-    status_msg = await message.reply("🔮 Вспоминаю, о чём вы шептались...")
-
-    summary_text = await generate_summary()
-    safe_summary = html.escape(summary_text)
-
-    await status_msg.edit_text(
-        f"📜 <b>Краткая выжимка разговоров:</b>\n\n{safe_summary}"
-    )
-
-
-# =====================================================
-# CHAT COLLECTOR & RANDOM INTERACTIVE
-# =====================================================
-
-@dp.message()
-async def collect(
-    message: types.Message
-):
-    global last_random_comment_time
-
-    # только нужный чат
-    if message.chat.id != CHAT_ID:
-        return
-
-
-    # только текст
-    if not message.text:
-        return
-
-
-    # игнорируем команды
-    if message.text.startswith("/"):
-        return
-
-
-    # игнорируем ботов
-    if (
-        message.from_user
-        and message.from_user.is_bot
-    ):
-        return
-
-
-
-    username = (
-
-        message.from_user.first_name
-
-        if message.from_user
-        and message.from_user.first_name
-
-        else "Участник"
-
-    )
-
-
-    try:
-        await save_message(
-            username,
-            message.text
-        )
-
-
-        logging.info(
-            f"{username}: {message.text}"
-        )
-
-        # Проверяем прямое обращение (по имени «мяумяура» или Reply)
-        bot_info = await bot.get_me()
-        is_reply_to_bot = bool(
-            message.reply_to_message 
-            and message.reply_to_message.from_user 
-            and message.reply_to_message.from_user.id == bot_info.id
-        )
-        bot_username = bot_info.username.lower() if bot_info.username else ""
-        is_addressed = "мяумяура" in message.text.lower() or (bot_username and f"@{bot_username}" in message.text.lower())
-
-        # 1. Прямой вызов — ответ сразу, передавая контекст реплая и недавней переписки
-        if is_reply_to_bot or is_addressed:
-            await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-            reply_quote = message.reply_to_message.text if message.reply_to_message and message.reply_to_message.text else None
-            answer = await ask_wisdom(message.text, message.from_user, reply_quote)
-            
-            # Голосовой ответ ТОЛЬКО по прямой просьбе
-            should_voice = any(w in message.text.lower() for w in ["голос", "скажи", "озвуч", "войс", "наговори", "проговори"])
-            if should_voice:
-                await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.RECORD_VOICE)
-                audio_bytes = await text_to_speech_bytes(answer)
-                if audio_bytes:
-                    voice_file = BufferedInputFile(audio_bytes, filename="wisdom.mp3")
-                    await message.reply_voice(voice=voice_file, caption=f"🧙 {html.escape(answer)}")
-                    return
-
-            await message.reply(f"🧙 {html.escape(answer)}")
-            return
-
-        # 2. Спонтанное вклинивание в обычный диалог (шанс 10%, не чаще раза в 10 минут)
-        now = datetime.now(TZ)
-        if (now - last_random_comment_time) > timedelta(minutes=10):
-            if random.random() < 0.10:  # 10% шанс оценить контекст беседы
-                remark = await maybe_join_conversation(message.from_user)
-                if remark:
-                    last_random_comment_time = now
-                    await message.reply(f"🧙 {html.escape(remark)}")
-
-
-    except Exception as e:
-        logging.error(
-            f"Ошибка сохранения сообщения: {e}"
-        )
-
-
-# =====================================================
 # GEMINI HELPER (RETRY & FALLBACK)
 # =====================================================
 
@@ -1292,6 +1121,7 @@ async def call_gemini_safe(contents, config=None):
                     logging.error(f"Ошибка Gemini ({model}): {e}")
                     break
     raise RuntimeError("Сервера Gemini временно недоступны. Попробуйте позже.")
+
 
 # =====================================================
 # GEMINI FUNCTIONS
@@ -1340,6 +1170,134 @@ async def ask_wisdom(user_question: str, user: types.User | None = None, reply_q
     except Exception as e:
         logging.error(f"Gemini вопрос ошибка: {e}")
         return "Я рядом, но связь чуть сбоит. Выдохни и переспроси через пару секунд."
+
+
+async def fact_check_dispute(query: str) -> str:
+    """Фактчекер споров через Gemini с выходом в поиск."""
+    prompt = (
+        f"Тебя попросили рассудить спор и найти точный железный факт по вопросу: '{query}'.\n"
+        "Ответь кратко (2-3 предложения), с пруфами и железной логикой, по-пацански и объективно."
+    )
+    try:
+        try:
+            config = genai_types.GenerateContentConfig(
+                temperature=0.3,
+                system_instruction=WISDOM_SYSTEM_INSTRUCTION,
+                tools=[{"google_search": {}}]
+            )
+            response = await call_gemini_safe(contents=prompt, config=config)
+            return response.text.strip()
+        except Exception:
+            config = genai_types.GenerateContentConfig(
+                temperature=0.3,
+                system_instruction=WISDOM_SYSTEM_INSTRUCTION
+            )
+            response = await call_gemini_safe(contents=prompt, config=config)
+            return response.text.strip()
+    except Exception as e:
+        logging.error(f"Ошибка фактчека: {e}")
+        return "Спор мутный, пруфов в эфире не нашёл. Разберитесь на словах."
+
+
+async def summarize_media_url(url: str, user: types.User | None = None) -> str:
+    """Быстрый пересказ ссылок (YouTube, статьи, посты)."""
+    prompt = (
+        f"Пользователь прислал ссылку: {url}\n"
+        "Сделай краткий пересказ (1-2 ёмких предложения), в чём главная суть, и вынеси краткий вердикт: стоит ли тратить время или это проходняк."
+    )
+    try:
+        try:
+            config = genai_types.GenerateContentConfig(
+                temperature=0.5,
+                system_instruction=WISDOM_SYSTEM_INSTRUCTION,
+                tools=[{"google_search": {}}]
+            )
+            response = await call_gemini_safe(contents=prompt, config=config)
+            return response.text.strip()
+        except Exception:
+            config = genai_types.GenerateContentConfig(
+                temperature=0.5,
+                system_instruction=WISDOM_SYSTEM_INSTRUCTION
+            )
+            response = await call_gemini_safe(contents=prompt, config=config)
+            return response.text.strip()
+    except Exception as e:
+        logging.error(f"Ошибка пересказа ссылки: {e}")
+        return "Ссылка не открывается или закрыта от посторонних глаз."
+
+
+async def analyze_visual_media(media_bytes: bytes, mime_type: str, caption: str = "", user: types.User | None = None) -> str:
+    """Gemini Vision: анализ фото и кружочков."""
+    user_name = user.first_name if user else "Участник"
+    prompt = (
+        f"Тебе прислал медиа-файл {user_name}. "
+        f"Подпись к файлу (если есть): '{caption}'. "
+        "Внимательно посмотри на изображение/видео и прокомментируй по-пацански, с юмором, подколом или респектом (2 предложения)."
+    )
+    try:
+        part = genai_types.Part.from_bytes(data=media_bytes, mime_type=mime_type)
+        contents = [part, prompt]
+        response = await call_gemini_safe(
+            contents=contents,
+            config=genai_types.GenerateContentConfig(
+                temperature=0.7,
+                system_instruction=WISDOM_SYSTEM_INSTRUCTION
+            )
+        )
+        return response.text.strip()
+    except Exception as e:
+        logging.error(f"Ошибка Vision: {e}")
+        return "Глаза замылились, не смог разобрать картинку. Перешли ещё разок."
+
+
+async def transcribe_voice_bytes(voice_bytes: bytes) -> str:
+    """Перевод голосового сообщения в текст через Gemini Audio."""
+    prompt = "Расшифруй это голосовое сообщение дословно на русском языке. Напиши ТОЛЬКО текст того, что сказано, без лишних вступлений."
+    try:
+        part = genai_types.Part.from_bytes(data=voice_bytes, mime_type="audio/ogg")
+        response = await call_gemini_safe(
+            contents=[part, prompt],
+            config=genai_types.GenerateContentConfig(
+                temperature=0.2
+            )
+        )
+        return response.text.strip()
+    except Exception as e:
+        logging.error(f"Ошибка транскрибации войса: {e}")
+        return ""
+
+
+async def check_ilya_ponto_radar(message: types.Message) -> str:
+    """Радар понтов и духоты (только для Ильи @Akishinov)."""
+    if not message.from_user:
+        return ""
+    username = (message.from_user.username or "").lower()
+    first_name = (message.from_user.first_name or "").lower()
+
+    if username == "akishinov" or "илья" in first_name:
+        pont_keywords = [
+            "нефть", "баррел", "бабл", "бабк", "деньг", "зарплат", "тысяч", "тыщ", 
+            "миллион", "лям", "вахт", "олигарх", "богат", "кэш", "рубл", "доллар", "бакс", "доход", "потратил", "купил"
+        ]
+        text_lower = (message.text or message.caption or "").lower()
+        if any(k in text_lower for k in pont_keywords):
+            score = round(random.uniform(7.5, 9.9), 1)
+            prompt = (
+                f"Илья (@Akishinov) написал следующее сообщение: '{message.text}'.\n"
+                f"Радар понтов зафиксировал уровень {score}/10! Приземли его ироничным, смешным и пацанским подколом про нефть, баррели, бабло или вахту (строго 1-2 предложения)."
+            )
+            try:
+                response = await call_gemini_safe(
+                    contents=prompt,
+                    config=genai_types.GenerateContentConfig(
+                        temperature=0.8,
+                        system_instruction=WISDOM_SYSTEM_INSTRUCTION
+                    )
+                )
+                return f"🚨 <b>РАДАР ПОНТОВ:</b> Зафиксирован уровень понтов <b>{score}/10</b>!\n\n🧙 {html.escape(response.text.strip())}"
+            except Exception as e:
+                logging.error(f"Ошибка радара понтов: {e}")
+    return ""
 
 
 async def generate_text() -> dict:
@@ -1568,6 +1526,286 @@ async def send_weekly_digest():
         logging.info("Недельный дайджест успешно отправлен")
     except Exception as e:
         logging.error(f"Ошибка отправки дайджеста: {e}")
+
+
+# =====================================================
+# COMMANDS
+# =====================================================
+
+@dp.message(Command("start"))
+async def start(
+    message: types.Message
+):
+
+    await message.answer(
+        "🧙 Мудрец Мяумяура запущен.\n\n"
+        "📜 <b>Мои возможности:</b>\n"
+        "• Каждое утро в 09:00 — Мысль дня и погода\n"
+        "• /code или /паха — Сводка (шифр) для Пахи на Святом Носе\n"
+        "• /summary — Краткая выжимка (что пропустили в чате)\n"
+        "• /пробей <вопрос> — Разрулить любой спор по фактам с пруфами\n"
+        "• Каждое воскресенье в 20:00 — Итоги недели\n"
+        "• Кидай голосовые (я расшифрую) и фотки/кружочки (я заценю)!"
+    )
+
+
+
+@dp.message(Command("test"))
+async def test(
+    message: types.Message
+):
+
+    if ADMIN_ID and str(message.from_user.id) != str(ADMIN_ID):
+        await message.reply("🧙 Только хранитель знаний (администратор) может вызывать это испытание.")
+        return
+
+    await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+
+    await message.answer(
+        "🧠 Создаю тестовую мысль..."
+    )
+
+
+    await create_daily_post(
+        force=True
+    )
+
+
+@dp.message(Command("code", "paha", "svodka", "погода", "сводка", "код", "паха"))
+async def army_weather_cmd(message: types.Message):
+    """Генератор армейского кода для вахты Пахи на Святом Носе."""
+    await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+
+    current = await fetch_svyatoy_nos_army_weather()
+    full_code = build_army_code_string(current)
+
+    await message.reply(f"Погода Святой Нос: <code>{full_code}</code>")
+
+
+@dp.message(Command("summary"))
+async def summary_cmd(
+    message: types.Message
+):
+    """Краткая выжимка того, что произошло в чате за 12 часов."""
+    await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+
+    status_msg = await message.reply("🔮 Вспоминаю, о чём вы шептались...")
+
+    summary_text = await generate_summary()
+    safe_summary = html.escape(summary_text)
+
+    await status_msg.edit_text(
+        f"📜 <b>Краткая выжимка разговоров:</b>\n\n{safe_summary}"
+    )
+
+
+@dp.message(Command("probe", "пробей", "факт", "пруф", "спор", "чек"))
+async def probe_cmd(message: types.Message):
+    """Фактчекер споров по фактам с выходом в поиск."""
+    parts = message.text.split(maxsplit=1)
+    query = parts[1].strip() if len(parts) > 1 else ""
+    if not query and message.reply_to_message and message.reply_to_message.text:
+        query = message.reply_to_message.text.strip()
+    
+    if not query:
+        await message.reply("Напиши тему спора или вопрос, например: <code>/пробей сколько весит баррель нефти</code>")
+        return
+
+    await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+    verdict = await fact_check_dispute(query)
+    await message.reply(f"⚖️ <b>Вердикт Мудреца:</b>\n\n{html.escape(verdict)}")
+
+
+# =====================================================
+# MEDIA & VOICE HANDLERS
+# =====================================================
+
+@dp.message(F.voice)
+async def handle_voice_message(message: types.Message):
+    """Моментальная расшифровка голосовых сообщений."""
+    if message.chat.id != CHAT_ID:
+        return
+
+    username = message.from_user.first_name if message.from_user and message.from_user.first_name else "Участник"
+    try:
+        file = await bot.get_file(message.voice.file_id)
+        voice_buffer = io.BytesIO()
+        await bot.download_file(file.file_path, destination=voice_buffer)
+        voice_bytes = voice_buffer.getvalue()
+
+        transcribed = await transcribe_voice_bytes(voice_bytes)
+        if transcribed:
+            await save_message(username, f"[Голосовое сообщение]: {transcribed}")
+            await message.reply(f"🗣 <b>{html.escape(username)}</b> (расшифровка):\n<i>«{html.escape(transcribed)}»</i>")
+            
+            # Если в расшифровке обратились к боту — отвечаем сразу
+            bot_info = await bot.get_me()
+            bot_username = bot_info.username.lower() if bot_info.username else ""
+            if "мяумяура" in transcribed.lower() or (bot_username and f"@{bot_username}" in transcribed.lower()):
+                await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+                answer = await ask_wisdom(transcribed, message.from_user)
+                await message.answer(f"🧙 {html.escape(answer)}")
+    except Exception as e:
+        logging.error(f"Ошибка обработки войса: {e}")
+
+
+@dp.message(F.photo | F.video_note)
+async def handle_media_vision(message: types.Message):
+    """Gemini Vision: реакция на фото и видео-кружочки."""
+    if message.chat.id != CHAT_ID:
+        return
+
+    username = message.from_user.first_name if message.from_user and message.from_user.first_name else "Участник"
+    caption = message.caption or ""
+
+    # Проверяем, адресовано ли боту
+    bot_info = await bot.get_me()
+    is_reply_to_bot = bool(
+        message.reply_to_message 
+        and message.reply_to_message.from_user 
+        and message.reply_to_message.from_user.id == bot_info.id
+    )
+    bot_username = bot_info.username.lower() if bot_info.username else ""
+    is_addressed = "мяумяура" in caption.lower() or any(w in caption.lower() for w in ["зацени", "глянь", "посмотри", "оцени"]) or (bot_username and f"@{bot_username}" in caption.lower())
+
+    if is_reply_to_bot or is_addressed:
+        await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+        try:
+            media_buffer = io.BytesIO()
+            if message.photo:
+                file = await bot.get_file(message.photo[-1].file_id)
+                await bot.download_file(file.file_path, destination=media_buffer)
+                mime = "image/jpeg"
+            elif message.video_note:
+                file = await bot.get_file(message.video_note.file_id)
+                await bot.download_file(file.file_path, destination=media_buffer)
+                mime = "video/mp4"
+            else:
+                return
+
+            comment = await analyze_visual_media(media_buffer.getvalue(), mime, caption, message.from_user)
+            await message.reply(f"🧙 {html.escape(comment)}")
+            await save_message(username, f"[Медиа]: {caption} (Бот: {comment})")
+        except Exception as e:
+            logging.error(f"Ошибка Vision: {e}")
+
+
+# =====================================================
+# CHAT COLLECTOR & RANDOM INTERACTIVE
+# =====================================================
+
+@dp.message()
+async def collect(
+    message: types.Message
+):
+    global last_random_comment_time
+
+    # только нужный чат
+    if message.chat.id != CHAT_ID:
+        return
+
+
+    # только текст
+    if not message.text:
+        return
+
+
+    # игнорируем команды
+    if message.text.startswith("/"):
+        return
+
+
+    # игнорируем ботов
+    if (
+        message.from_user
+        and message.from_user.is_bot
+    ):
+        return
+
+
+
+    username = (
+
+        message.from_user.first_name
+
+        if message.from_user
+        and message.from_user.first_name
+
+        else "Участник"
+
+    )
+
+
+    try:
+        await save_message(
+            username,
+            message.text
+        )
+
+
+        logging.info(
+            f"{username}: {message.text}"
+        )
+
+        # 1. Проверяем Радар понтов для Ильи
+        ponto_alert = await check_ilya_ponto_radar(message)
+        if ponto_alert:
+            await message.reply(ponto_alert)
+            return
+
+        # 2. Быстрый пересказ ссылок (если прислали ссылку и тегнули/спросили или прямо в сообщении)
+        url_match = re.search(r'https?://\S+', message.text)
+        if url_match:
+            is_asking_link = any(w in message.text.lower() for w in ["зацени", "глянь", "че там", "о чем", "перескажи", "суть", "мяумяура"])
+            if is_asking_link:
+                await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+                summary_link = await summarize_media_url(url_match.group(0), message.from_user)
+                await message.reply(f"🎬 <b>Суть ссылки:</b>\n{html.escape(summary_link)}")
+                return
+
+        # 3. Проверяем прямое обращение (по имени «мяумяура» или Reply)
+        bot_info = await bot.get_me()
+        is_reply_to_bot = bool(
+            message.reply_to_message 
+            and message.reply_to_message.from_user 
+            and message.reply_to_message.from_user.id == bot_info.id
+        )
+        bot_username = bot_info.username.lower() if bot_info.username else ""
+        is_addressed = "мяумяура" in message.text.lower() or (bot_username and f"@{bot_username}" in message.text.lower())
+
+        # Прямой вызов — ответ сразу
+        if is_reply_to_bot or is_addressed:
+            await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+            reply_quote = message.reply_to_message.text if message.reply_to_message and message.reply_to_message.text else None
+            answer = await ask_wisdom(message.text, message.from_user, reply_quote)
+            
+            # Голосовой ответ ТОЛЬКО по прямой просьбе
+            should_voice = any(w in message.text.lower() for w in ["голос", "скажи", "озвуч", "войс", "наговори", "проговори"])
+            if should_voice:
+                await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.RECORD_VOICE)
+                audio_bytes = await text_to_speech_bytes(answer)
+                if audio_bytes:
+                    voice_file = BufferedInputFile(audio_bytes, filename="wisdom.mp3")
+                    await message.reply_voice(voice=voice_file, caption=f"🧙 {html.escape(answer)}")
+                    return
+
+            await message.reply(f"🧙 {html.escape(answer)}")
+            return
+
+        # 4. Спонтанное вклинивание в обычный диалог (шанс 10%, не чаще раза в 10 минут)
+        now = datetime.now(TZ)
+        if (now - last_random_comment_time) > timedelta(minutes=10):
+            if random.random() < 0.10:  # 10% шанс оценить контекст беседы
+                remark = await maybe_join_conversation(message.from_user)
+                if remark:
+                    last_random_comment_time = now
+                    await message.reply(f"🧙 {html.escape(remark)}")
+
+
+    except Exception as e:
+        logging.error(
+            f"Ошибка сохранения сообщения: {e}"
+        )
 
 
 # =====================================================
