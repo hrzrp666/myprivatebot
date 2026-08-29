@@ -729,390 +729,6 @@ async def save_post_today():
 
 
 # =====================================================
-# АРМЕЙСКАЯ СВОДКА ДЛЯ ПАХИ (МЫС СВЯТОЙ НОС)
-# =====================================================
-
-def parse_wind_dir_from_text(dir_text: str) -> str:
-    """Определяет код направления ветра (1-8) из текста Росгидромета/Метеоинфо."""
-    dt = dir_text.lower().strip()
-    if any(k in dt for k in ["северо-восток", "северо-восточн", "с-в", "св"]):
-        return "1"
-    elif any(k in dt for k in ["северо-запад", "северо-западн", "с-з", "сз"]):
-        return "7"
-    elif any(k in dt for k in ["юго-восток", "юго-восточн", "ю-в", "юв"]):
-        return "3"
-    elif any(k in dt for k in ["юго-запад", "юго-западн", "ю-з", "юз"]):
-        return "5"
-    elif any(k in dt for k in ["восточн", "восток", " в "]) or dt == "в":
-        return "2"
-    elif any(k in dt for k in ["западн", "запад", " з "]) or dt == "з":
-        return "6"
-    elif any(k in dt for k in ["южн", "юг", " ю "]) or dt == "ю":
-        return "4"
-    elif any(k in dt for k in ["северн", "север", " с "]) or dt == "с":
-        return "8"
-    return "8"
-
-
-def encode_army_phenomenon(
-    weather_code: int = 0,
-    wind_gusts_ms: float = 0,
-    vis_meters: float = 20000,
-    precip_mm: float = 0.0
-) -> tuple[str, str]:
-    """
-    Определяет явление погоды по независимому синоптическому радару:
-    - Туман (06) ТОЛЬКО при метеорологическом коде тумана (45, 48) И видимости <= 1000 метров.
-    - Дождь / морось / снег при соответствующих кодах и осадках.
-    - Если явлений нет — по армейскому регламенту всегда пишется 03 (дымка).
-    """
-    # Туман возможен только если видимость реально упала до 1 км и ниже
-    has_fog = (weather_code in [45, 48]) and (vis_meters <= 1000)
-    has_rain = (weather_code in [61, 63, 65, 80, 81, 82]) or (precip_mm >= 0.2 and weather_code not in [71, 73, 75, 85, 86])
-    has_drizzle = (weather_code in [51, 53, 55])
-    has_snow = (weather_code in [71, 73, 75, 85, 86])
-    has_thunder = (weather_code == 95)
-    has_squall = (wind_gusts_ms >= 18.0 and (has_rain or has_snow or has_thunder))
-
-    # Комбинации с туманом
-    if has_fog and has_rain:
-        return "06/08", "Туман с дождём"
-    if has_fog and has_drizzle:
-        return "06/07", "Туман с моросью"
-    if has_fog and has_snow:
-        return "06/09", "Туман со снегом"
-
-    # Одиночные явления
-    if has_squall:
-        return "01", "Шквал"
-    if has_thunder:
-        return "13", "Гроза"
-    if has_snow:
-        return "09", "Снег"
-    if has_rain:
-        return "08", "Дождь"
-    if has_drizzle:
-        return "07", "Морось"
-    if has_fog:
-        return "06", "Туман"
-
-    # Если осадков и тумана нет — по регламенту пишется 03 (дымка)
-    return "03", "Дымка"
-
-
-def encode_army_wind_dir(degrees: float) -> tuple[str, str]:
-    deg = degrees % 360
-    if 22.5 <= deg < 67.5:
-        return "1", "Северо-восточный"
-    elif 67.5 <= deg < 112.5:
-        return "2", "Восточный"
-    elif 112.5 <= deg < 157.5:
-        return "3", "Юго-восточный"
-    elif 157.5 <= deg < 202.5:
-        return "4", "Южный"
-    elif 202.5 <= deg < 247.5:
-        return "5", "Юго-западный"
-    elif 247.5 <= deg < 292.5:
-        return "6", "Западный"
-    elif 292.5 <= deg < 337.5:
-        return "7", "Северо-западный"
-    else:
-        return "8", "Северный"
-
-
-def encode_army_visibility(vis_meters: float) -> tuple[str, str]:
-    if vis_meters >= 14000:
-        return "7", "10 миль"
-    elif vis_meters >= 7000:
-        return "6", "5 миль"
-    elif vis_meters >= 3500:
-        return "5", "2,5 мили"
-    elif vis_meters >= 1500:
-        return "4", "1 миля"
-    elif vis_meters >= 700:
-        return "3", "5 кабельтовых"
-    elif vis_meters >= 300:
-        return "2", "2–3 кабельтова"
-    else:
-        return "1", "1 кабельтов"
-
-
-def encode_army_sea_state(wind_speed_ms: float) -> tuple[str, str]:
-    if wind_speed_ms < 1.0:
-        return "00", "Штиль"
-    elif wind_speed_ms <= 3.3:
-        return "10", "1 балл"
-    elif wind_speed_ms <= 5.4:
-        return "20", "2 балла"
-    elif wind_speed_ms <= 7.9:
-        return "30", "3 балла"
-    elif wind_speed_ms <= 10.7:
-        return "40", "4 балла"
-    elif wind_speed_ms <= 13.8:
-        return "50", "5 баллов"
-    elif wind_speed_ms <= 17.1:
-        return "60", "6 баллов"
-    elif wind_speed_ms <= 20.7:
-        return "70", "7 баллов"
-    elif wind_speed_ms <= 24.4:
-        return "80", "8 баллов"
-    else:
-        return "90", "9 баллов"
-
-
-def parse_meteoinfo_html(html_content: str) -> dict | None:
-    """Парсит показатели фактической погоды с метеостанции meteoinfo.ru."""
-    try:
-        # Изолируем только таблицу фактических измерений
-        table_match = re.search(r'<table[^>]*>(.*?)</table>', html_content, re.DOTALL | re.IGNORECASE)
-        table_html = table_match.group(1) if table_match else html_content
-
-        clean = re.sub(r'<[^>]+>', ' ', table_html)
-        clean = clean.replace('&deg;', '°').replace('&nbsp;', ' ')
-        clean = re.sub(r'\s+', ' ', clean)
-
-        data = {}
-
-        # 1. Температура воздуха
-        t_m = re.search(r'Температура воздуха[^\d\-+]*([+\-]?\d+(?:[.,]\d+)?)', clean, re.IGNORECASE)
-        if t_m:
-            data["temperature_2m"] = float(t_m.group(1).replace(',', '.'))
-
-        # 2. Влажность
-        h_m = re.search(r'Относительная влажность[^\d]*(\d+(?:[.,]\d+)?)', clean, re.IGNORECASE)
-        if h_m:
-            data["humidity"] = float(h_m.group(1).replace(',', '.'))
-
-        # 3. Направление ветра
-        w_dir_m = re.search(r'Направление ветра\s*[:,-]?\s*([а-яА-Яa-zA-Z\-]+)', clean, re.IGNORECASE)
-        if w_dir_m:
-            dir_text = w_dir_m.group(1).lower()
-            data["wind_dir_code"] = parse_wind_dir_from_text(dir_text)
-
-        # 4. Скорость ветра
-        w_spd_m = re.search(r'Средняя скорость ветра[^\d]*(\d+(?:[.,]\d+)?)', clean, re.IGNORECASE)
-        if w_spd_m:
-            data["wind_speed_10m"] = float(w_spd_m.group(1).replace(',', '.'))
-
-        # 5. Порывы
-        w_gust_m = re.search(r'Порывы[^\d]*(\d+(?:[.,]\d+)?)', clean, re.IGNORECASE)
-        if w_gust_m:
-            data["wind_gusts_10m"] = float(w_gust_m.group(1).replace(',', '.'))
-
-        # 6. Горизонтальная видимость (строго берем реальное значение сайта)
-        vis_m = re.search(r'Горизонтальная видимость[^\d]*(\d+(?:[.,]\d+)?)', clean, re.IGNORECASE)
-        if vis_m:
-            v_val = float(vis_m.group(1).replace(',', '.'))
-            data["visibility"] = v_val * 1000 if v_val < 100 else v_val
-
-        # 7. Осадки
-        precip_m = re.search(r'Осадки за \d+ часов[^\d]*(\d+(?:[.,]\d+)?)', clean, re.IGNORECASE)
-        if precip_m:
-            data["precip_mm"] = float(precip_m.group(1).replace(',', '.'))
-        else:
-            data["precip_mm"] = 0.0
-
-        if "temperature_2m" in data and "wind_speed_10m" in data:
-            return data
-    except Exception as e:
-        logging.warning(f"Ошибка парсинга meteoinfo.ru: {e}")
-    return None
-
-
-async def fetch_radar_phenomenon_code() -> int:
-    """Запрашивает текущий синоптический WMO код явления с метеорадара Open-Meteo."""
-    url_radar = (
-        f"https://api.open-meteo.com/v1/forecast"
-        f"?latitude={SVYATOY_NOS_LAT}&longitude={SVYATOY_NOS_LON}"
-        f"&current=weather_code"
-        f"&timezone=Europe%2FMoscow"
-    )
-    try:
-        session = await get_http_session()
-        headers = {"User-Agent": "Mozilla/5.0"}
-        async with session.get(url_radar, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return int(data.get("current", {}).get("weather_code", 0))
-    except Exception as e:
-        logging.warning(f"Ошибка получения кода явления с радара: {e}")
-    return 0
-
-
-async def fetch_svyatoy_nos_army_weather() -> dict:
-    """
-    Получает актуальные метеоданные Святого Носа:
-    1. Все метрики: meteoinfo.ru (Официальный Росгидромет / Станция Святой Нос)
-    2. Явления: Open-Meteo WMO Радар
-    3. Резервные каналы при недоступности Росгидромета: wttr.in и Open-Meteo
-    """
-    cached = get_cached_weather("svyatoy_nos_army")
-    if cached:
-        return cached
-
-    session = await get_http_session()
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"}
-
-    # 1. Запрашиваем официальную метеостанцию meteoinfo.ru и радар параллельно
-    url_meteoinfo = "https://meteoinfo.ru/pogoda/russia/murmansk-area/svjatoi-nos"
-    try:
-        meteoinfo_task = session.get(url_meteoinfo, headers=headers, timeout=aiohttp.ClientTimeout(total=6))
-        radar_task = fetch_radar_phenomenon_code()
-        
-        resp, radar_code = await asyncio.gather(meteoinfo_task, radar_task, return_exceptions=True)
-        
-        if not isinstance(resp, Exception) and resp.status == 200:
-            html_body = await resp.text()
-            parsed_meteoinfo = parse_meteoinfo_html(html_body)
-            if parsed_meteoinfo:
-                parsed_meteoinfo["weather_code"] = radar_code if isinstance(radar_code, int) else 0
-                set_cached_weather("svyatoy_nos_army", parsed_meteoinfo)
-                logging.info("Погода Святого Носа получена: метрики с meteoinfo.ru, явление с радара")
-                return parsed_meteoinfo
-    except Exception as e:
-        logging.warning(f"meteoinfo.ru недоступен ({e}). Переключаюсь на резервные источники...")
-
-    # 2. РЕЗЕРВ 1: wttr.in
-    url_wttr = f"https://wttr.in/{SVYATOY_NOS_LAT},{SVYATOY_NOS_LON}?format=j1"
-    try:
-        async with session.get(url_wttr, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-            if resp.status == 200:
-                data = await resp.json(content_type=None)
-                cur = data.get("current_condition", [{}])[0]
-                temp = float(cur.get("temp_C", 5))
-                wind_kmh = float(cur.get("windspeedKmph", 15))
-                wind_ms = wind_kmh / 3.6
-                wind_dir = float(cur.get("winddirDegree", 90))
-                vis_km = float(cur.get("visibility", 10))
-                humidity = float(cur.get("humidity", 90))
-                precip_mm = float(cur.get("precipMM", 0.0))
-                w_desc_code = cur.get("weatherCode", "113")
-
-                # Маппинг погоды в коды (без ложного тумана на 143)
-                w_code = 0
-                wc = int(w_desc_code) if str(w_desc_code).isdigit() else 113
-                if wc in [386, 389, 392, 395]:
-                    w_code = 95
-                elif wc in [227, 323, 326, 329, 332, 335, 338, 368, 371]:
-                    w_code = 71
-                elif wc in [176, 263, 266, 293, 296, 299, 302, 305, 308, 353, 356, 359]:
-                    w_code = 61
-                elif wc in [248, 260]:
-                    w_code = 45
-                elif wc in [119, 122]:
-                    w_code = 3
-                elif wc == 116:
-                    w_code = 2
-
-                parsed = {
-                    "temperature_2m": temp,
-                    "wind_speed_10m": wind_ms,
-                    "wind_direction_10m": wind_dir,
-                    "wind_gusts_10m": wind_ms * 1.25,
-                    "weather_code": w_code,
-                    "visibility": vis_km * 1000,
-                    "humidity": humidity,
-                    "precip_mm": precip_mm
-                }
-                set_cached_weather("svyatoy_nos_army", parsed)
-                logging.info("Погода Святого Носа получена через wttr.in (резерв)")
-                return parsed
-    except Exception as e:
-        logging.warning(f"wttr.in ошибка ({e}). Пробую Open-Meteo...")
-
-    # 3. РЕЗЕРВ 2: Open-Meteo
-    url_om = (
-        f"https://api.open-meteo.com/v1/forecast"
-        f"?latitude={SVYATOY_NOS_LAT}&longitude={SVYATOY_NOS_LON}"
-        f"&current=temperature_2m,relative_humidity_2m,precipitation,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m"
-        f"&hourly=visibility"
-        f"&wind_speed_unit=ms"
-        f"&forecast_days=1"
-        f"&timezone=Europe%2FMoscow"
-    )
-    try:
-        async with session.get(url_om, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-            if resp.status == 200:
-                data = await resp.json(content_type=None)
-                current = data.get("current", {})
-                hourly = data.get("hourly", {})
-                vis_list = hourly.get("visibility", [])
-                current["visibility"] = vis_list[0] if vis_list else 20000
-                current["humidity"] = current.get("relative_humidity_2m", 90)
-                current["precip_mm"] = current.get("precipitation", 0.0)
-                set_cached_weather("svyatoy_nos_army", current)
-                return current
-    except Exception as e:
-        logging.warning(f"Open-Meteo ошибка: {e}")
-
-    # 4. Предыдущий кэш
-    last_known = get_last_known_weather("svyatoy_nos_army")
-    if last_known:
-        return last_known
-
-    # 5. Аварийный дефолт
-    return {
-        "temperature_2m": 6.0,
-        "wind_speed_10m": 4.0,
-        "wind_direction_10m": 90.0,
-        "wind_gusts_10m": 5.0,
-        "weather_code": 3,
-        "visibility": 10000,
-        "humidity": 92.0,
-        "precip_mm": 0.0
-    }
-
-
-def build_army_code_string(current: dict) -> str:
-    """Генерирует шифр по фактическим метеоданным сайта без искусственных изменений."""
-    w_code = current.get("weather_code", 0)
-    w_spd_ms = round(current.get("wind_speed_10m", 0))
-    w_gusts_ms = round(current.get("wind_gusts_10m", 0))
-    temp = round(current.get("temperature_2m", 10))
-    vis_m = current.get("visibility", 20000)
-    precip_mm = current.get("precip_mm", 0.0)
-
-    # 1. Направление ветра
-    if "wind_dir_code" in current:
-        wdir_code = current["wind_dir_code"]
-    else:
-        w_dir_deg = current.get("wind_direction_10m", 0)
-        wdir_code, _ = encode_army_wind_dir(w_dir_deg)
-
-    # 2. Явление (радар + валидация видимостью)
-    ph_code, _ = encode_army_phenomenon(
-        weather_code=w_code,
-        wind_gusts_ms=w_gusts_ms,
-        vis_meters=vis_m,
-        precip_mm=precip_mm
-    )
-
-    # 3. Скорость, видимость, температура (строго по реальным данным сайта)
-    wspd_code = f"{max(0, min(99, w_spd_ms)):02d}"
-    vis_code, _ = encode_army_visibility(vis_m)
-    temp_code = f"{abs(temp):02d}"
-
-    # 4. Волнение моря: если видимость <= 3 (5 каб и меньше), море не видно -> "хх"
-    if int(vis_code) <= 3:
-        sea_code = "хх"
-    else:
-        sea_code, _ = encode_army_sea_state(w_spd_ms)
-
-    return f"{ph_code}{wdir_code}{wspd_code}{vis_code}{temp_code}{sea_code}"
-
-
-async def send_auto_army_weather():
-    """Автоматическая отправка 1-строчной сводки для дежурства Пахи каждые 2 часа (20:00–08:00 МСК)."""
-    try:
-        current = await fetch_svyatoy_nos_army_weather()
-        full_code = build_army_code_string(current)
-        await bot.send_message(CHAT_ID, f"Погода Святой Нос: <code>{full_code}</code>")
-        logging.info(f"Авто-сводка для Пахи отправлена: {full_code}")
-    except Exception as e:
-        logging.error(f"Ошибка отправки авто-сводки для Пахи: {e}")
-
-
-# =====================================================
 # GEMINI HELPER (RETRY & FALLBACK)
 # =====================================================
 
@@ -1139,7 +755,7 @@ async def call_gemini_safe(contents, config=None):
                 return response
             except Exception as e:
                 err_str = str(e)
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str:
+                if "429" in err_str or "RESOURCE_EXUSITED" in err_str or "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str:
                     logging.warning(f"Gemini перегрузка/лимит ({model}, попытка {attempt+1}/3). Ждем...")
                     await asyncio.sleep(2 * (attempt + 1))
                 elif "404" in err_str or "NOT_FOUND" in err_str:
@@ -1227,28 +843,72 @@ async def fact_check_dispute(query: str) -> str:
         return "Спор мутный, пруфов в эфире не нашёл. Разберитесь на словах."
 
 
+async def fetch_url_metadata(url: str) -> str:
+    """Извлекает заголовок и описание страницы по ссылке (включая YouTube oEmbed)."""
+    session = await get_http_session()
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    
+    # 1. YouTube через официальный oEmbed
+    if "youtube.com" in url or "youtu.be" in url:
+        try:
+            oembed_url = f"https://www.youtube.com/oembed?url={url}&format=json"
+            async with session.get(oembed_url, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    title = data.get("title", "")
+                    author = data.get("author_name", "")
+                    return f"Видео на YouTube: '{title}' от автора '{author}'"
+        except Exception:
+            pass
+
+    # 2. OpenGraph и Title для обычных сайтов и статей
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status == 200:
+                html_text = await resp.text(errors='ignore')
+                
+                title_match = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\'](.*?)["\']', html_text, re.IGNORECASE) or \
+                              re.search(r'<title>(.*?)</title>', html_text, re.IGNORECASE)
+                title = title_match.group(1).strip() if title_match else ""
+                
+                desc_match = re.search(r'<meta\s+property=["\']og:description["\']\s+content=["\'](.*?)["\']', html_text, re.IGNORECASE) or \
+                             re.search(r'<meta\s+name=["\']description["\']\s+content=["\'](.*?)["\']', html_text, re.IGNORECASE)
+                desc = desc_match.group(1).strip() if desc_match else ""
+                
+                if title or desc:
+                    return f"Заголовок: {title}\nОписание/Суть: {desc}"
+    except Exception as e:
+        logging.warning(f"Не удалось вытащить метаданные ссылки ({url}): {e}")
+        
+    return ""
+
+
 async def summarize_media_url(url: str, user: types.User | None = None) -> str:
     """Быстрый пересказ ссылок (YouTube, статьи, посты)."""
-    prompt = (
-        f"Пользователь прислал ссылку: {url}\n"
-        "Сделай краткий пересказ (1-2 ёмких предложения), в чём главная суть, и вынеси краткий вердикт: стоит ли тратить время или это проходняк."
-    )
+    meta_info = await fetch_url_metadata(url)
+    
+    if meta_info:
+        prompt = (
+            f"Пользователь прислал ссылку: {url}\n"
+            f"Вот реальные данные о содержании этой страницы/видео:\n{meta_info}\n\n"
+            "Сделай краткий, живой пересказ (1-2 ёмких предложения), в чём суть материала, "
+            "и вынеси вердикт в своём стиле: стоит ли тратить время или это проходняк."
+        )
+    else:
+        prompt = (
+            f"Пользователь прислал ссылку: {url}\n"
+            "Попробуй определить суть по ссылке и вынеси краткий вердикт (1-2 предложения)."
+        )
+
     try:
-        try:
-            config = genai_types.GenerateContentConfig(
-                temperature=0.5,
-                system_instruction=WISDOM_SYSTEM_INSTRUCTION,
-                tools=[{"google_search": {}}]
-            )
-            response = await call_gemini_safe(contents=prompt, config=config)
-            return response.text.strip()
-        except Exception:
-            config = genai_types.GenerateContentConfig(
-                temperature=0.5,
+        response = await call_gemini_safe(
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                temperature=0.6,
                 system_instruction=WISDOM_SYSTEM_INSTRUCTION
             )
-            response = await call_gemini_safe(contents=prompt, config=config)
-            return response.text.strip()
+        )
+        return response.text.strip()
     except Exception as e:
         logging.error(f"Ошибка пересказа ссылки: {e}")
         return "Ссылка не открывается или закрыта от посторонних глаз."
@@ -1569,7 +1229,6 @@ async def start(
         "🧙 Мудрец Мяумяура запущен.\n\n"
         "📜 <b>Мои возможности:</b>\n"
         "• Каждое утро в 09:00 — Мысль дня и погода\n"
-        "• /code или /паха — Сводка (шифр) для Пахи на Святом Носе\n"
         "• /summary — Краткая выжимка (что пропустили в чате)\n"
         "• /пробей <вопрос> — Разрулить любой спор по фактам с пруфами\n"
         "• Каждое воскресенье в 20:00 — Итоги недели\n"
@@ -1597,17 +1256,6 @@ async def test(
     await create_daily_post(
         force=True
     )
-
-
-@dp.message(Command("code", "paha", "svodka", "погода", "сводка", "код", "паха"))
-async def army_weather_cmd(message: types.Message):
-    """Генератор армейского кода для вахты Пахи на Святом Носе."""
-    await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-
-    current = await fetch_svyatoy_nos_army_weather()
-    full_code = build_army_code_string(current)
-
-    await message.reply(f"Погода Святой Нос: <code>{full_code}</code>")
 
 
 @dp.message(Command("summary"))
@@ -1883,23 +1531,10 @@ def setup_scheduler():
         coalesce=True
     )
 
-    # Авто-сводка для Пахи: с 20:00 до 08:00 по МСК каждые 2 часа в :00
-    scheduler.add_job(
-        send_auto_army_weather,
-        "cron",
-        hour="0,2,4,6,8,20,22",
-        minute=0,
-        timezone=TZ_MSK,
-        id="army_weather_paha",
-        replace_existing=True,
-        misfire_grace_time=3600,
-        coalesce=True
-    )
-
     scheduler.start()
 
     logging.info(
-        "Планировщик запущен: Иркутск 09:00 (daily), Вс 20:00 (weekly), МСК 20:00-08:00 (Паха каждые 2ч)"
+        "Планировщик запущен: Иркутск 09:00 (daily), Вс 20:00 (weekly)"
     )
 
 
