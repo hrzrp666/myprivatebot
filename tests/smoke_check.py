@@ -7,15 +7,19 @@ import asyncio
 import re
 import sys
 from pathlib import Path
+from datetime import datetime
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import ai_service  # noqa: E402
+import brain  # noqa: E402
 import config  # noqa: E402
 import database  # noqa: E402
 import handlers  # noqa: E402
+import stickers  # noqa: E402
 import weather  # noqa: E402
+from google.genai import types as genai_types  # noqa: E402
 
 
 def check_reply_quote() -> None:
@@ -51,9 +55,6 @@ def check_weather_logic() -> None:
     # Святого Носа больше нет
     assert "Свято" not in name("поясни за погодку, дежурство")
 
-    text = "доброе утро, завтра на работу"
-    assert not any(k in text for k in config.WEATHER_KEYWORDS), "утро не должно запускать погоду"
-    assert any(k in "какая завтра погода" for k in config.WEATHER_KEYWORDS)
     print("weather logic OK")
 
 
@@ -104,6 +105,129 @@ async def check_long_memory() -> None:
     print("long memory OK")
 
 
+def check_brain_pure() -> None:
+    """Диалог ролями, разбор решения «отвечать ли», безопасные ссылки."""
+    dt = datetime(2026, 11, 16, 18, 5, tzinfo=config.TZ)
+    rows = [
+        ("Захар", "привет", dt),
+        (config.BOT_NAME, "здорово", dt),
+        ("Паша", "как дела", dt),
+        ("Илья", "норм", dt),
+    ]
+    contents = brain.build_dialogue(rows, "[ответь Илье]")
+    assert [c.role for c in contents] == ["user", "model", "user"], [c.role for c in contents]
+    last = contents[-1].parts[0].text
+    assert "[16.11 18:05] Паша: как дела" in last and "Илья: норм" in last
+    assert last.endswith("[ответь Илье]")
+    assert contents[1].parts[0].text == "здорово"
+
+    # диалог не начинается с реплики бота и всегда заканчивается пользователем
+    contents = brain.build_dialogue([(config.BOT_NAME, "x", dt), ("Захар", "y", dt)], "note")
+    assert [c.role for c in contents] == ["user"]
+    contents = brain.build_dialogue([("Захар", "y", dt), (config.BOT_NAME, "x", dt)], "note")
+    assert [c.role for c in contents] == ["user", "model", "user"]
+    assert brain.build_dialogue([], "note")[0].parts[0].text == "note"
+
+    parse = brain.parse_decision
+    d = parse('{"action": "react", "addressed": false, "emoji": "❤️"}')
+    assert d.action == "react" and d.emoji == "❤", d
+    assert parse('{"action": "react", "emoji": "🦖"}').action == "ignore"
+    assert parse("полная ерунда").action == "ignore"
+    assert parse('{"action": "dance"}').action == "ignore"
+    d = parse('```json\n{"action": "reply", "addressed": true, "emoji": ""}\n```')
+    assert d.action == "reply" and d.addressed is True
+
+    safe = brain.is_safe_public_url
+    assert safe("https://youtube.com/watch?v=1") and safe("http://example.com")
+    for bad in ("http://localhost:8080", "http://127.0.0.1", "http://10.0.0.5/x",
+                "http://169.254.169.254/latest", "ftp://example.com", "javascript:alert(1)"):
+        assert not safe(bad), bad
+
+    assert brain._extract_text(SimpleNamespace(text="[16.11 18:05] Мудрец Мяумяура: Здорово")) == "Здорово"
+    assert brain._extract_text(SimpleNamespace(text="Мяумяура: Ну")) == "Ну"
+    assert brain._extract_text(SimpleNamespace(text="Обычный ответ")) == "Обычный ответ"
+    print("brain pure OK")
+
+
+async def check_brain_with_db() -> None:
+    """Инструменты, цикл вызова функций и решение «отвечать ли» с подставным Gemini."""
+    reply = brain.BotReply()
+    assert "нельзя" in await brain.run_tool("react", {"emoji": "🦖"}, reply) and reply.reaction is None
+    await brain.run_tool("react", {"emoji": "🔥"}, reply)
+    assert reply.reaction == "🔥"
+    await brain.run_tool("reply_with_voice", {}, reply)
+    assert reply.voice is True
+    assert "нельзя" in await brain.run_tool("open_link", {"url": "http://127.0.0.1/admin"}, reply)
+    assert "Неизвестная" in await brain.run_tool("hack", {}, reply)
+
+    await ai_service.clear_memory()
+    await brain.run_tool("remember_fact", {"fact": "Паша устроился на работу"}, reply)
+    assert "Паша устроился на работу" in await ai_service.get_memory_context()
+    await ai_service.clear_memory()
+
+    assert "нет стикеров" in await brain.run_tool("send_sticker", {"emoji": "😂"}, reply)
+    await stickers.remember_sticker("FILE1", "U1", "😂")
+    await stickers.remember_sticker("FILE1", "U1", "😂")  # дубль не добавляется
+    await stickers.remember_sticker("FILE2", "U2", "👍")
+    assert await stickers.available_sticker_emojis() == ["😂", "👍"]
+    assert "Такого стикера нет" in await brain.run_tool("send_sticker", {"emoji": "🐸"}, reply)
+    await brain.run_tool("send_sticker", {"emoji": "😂"}, reply)
+    assert reply.sticker_file_id == "FILE1"
+
+    asked = []
+
+    async def fake_weather(query, user=None):
+        asked.append(query)
+        return "Локация: Иркутск\nСейчас: -5°C, снег"
+
+    calls = []
+
+    async def fake_gemini(contents=None, config=None, **kwargs):
+        calls.append(contents)
+        if len(calls) == 1:
+            return SimpleNamespace(
+                function_calls=[SimpleNamespace(name="get_weather", args={"location": "Иркутск"})],
+                candidates=[SimpleNamespace(content=genai_types.Content(
+                    role="model", parts=[genai_types.Part(text="(вызов)")]))],
+                text=None,
+            )
+        return SimpleNamespace(
+            function_calls=None, candidates=[],
+            text="[16.11 18:05] Мудрец Мяумяура: В Иркутске -5 и снег, одевайся теплее.",
+        )
+
+    async def broken_gemini(*args, **kwargs):
+        raise RuntimeError("Gemini лежит")
+
+    original_gemini, original_weather = brain.call_gemini_safe, brain.fetch_dynamic_weather
+    try:
+        brain.call_gemini_safe, brain.fetch_dynamic_weather = fake_gemini, fake_weather
+        user = SimpleNamespace(first_name="Захар", username="zaharyan14", id=5)
+        answer = await brain.ask_wisdom("какая погода в иркутске?", user)
+        assert answer.text == "В Иркутске -5 и снег, одевайся теплее.", answer.text
+        assert answer.tools_used == ["get_weather"] and asked == ["погода в Иркутск"]
+        # во второй запрос ушли: история + вызов модели + результат функции
+        second = calls[1]
+        assert second[-1].parts[0].function_response.name == "get_weather"
+        assert second[-1].parts[0].function_response.response["result"].startswith("Локация: Иркутск")
+
+        brain.call_gemini_safe = broken_gemini
+        assert (await brain.ask_wisdom("эй", user)).text == brain.FALLBACK_TEXT
+        assert (await brain.ask_wisdom("эй", user, spontaneous=True)).is_empty
+        assert (await brain.decide_engagement(None)).action == "ignore"
+
+        async def decide_reply(*args, **kwargs):
+            assert kwargs.get("models") == ai_service.LIGHT_MODELS
+            return SimpleNamespace(text='{"action": "reply", "addressed": true, "emoji": ""}')
+
+        brain.call_gemini_safe = decide_reply
+        decision = await brain.decide_engagement(12.0)
+        assert decision.action == "reply" and decision.addressed is True
+    finally:
+        brain.call_gemini_safe, brain.fetch_dynamic_weather = original_gemini, original_weather
+    print("brain with db OK")
+
+
 async def check_database() -> None:
     backend = "postgres" if config.DATABASE_URL else "sqlite"
     await database.init_db()
@@ -131,6 +255,7 @@ async def check_database() -> None:
         assert "второе сообщение" in await database.get_recent_messages(hours=1, limit=10)
 
         await check_long_memory()
+        await check_brain_with_db()
     finally:
         await database.close_db()
     print(f"database OK ({backend})")
@@ -139,4 +264,5 @@ async def check_database() -> None:
 if __name__ == "__main__":
     check_weather_logic()
     check_reply_quote()
+    check_brain_pure()
     asyncio.run(check_database())

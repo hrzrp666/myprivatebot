@@ -15,13 +15,11 @@ from config import (
     GEMINI_KEY,
     PONT_KEYWORDS,
     TZ,
-    WEATHER_DIRECT_KEYWORDS,
-    WEATHER_KEYWORDS,
     WISDOM_SYSTEM_INSTRUCTION,
     get_user_context,
 )
 from database import get_kv, get_recent_messages, get_weekly_sampled_messages, set_kv
-from weather import fetch_dynamic_weather, get_http_session
+from weather import get_http_session
 
 gemini = genai.Client(api_key=GEMINI_KEY)
 
@@ -38,6 +36,12 @@ _MODELS_PRIORITY = [
     "gemini-2.0-flash",
     "gemini-2.5-flash-lite",
     "gemini-3-flash-preview",
+]
+# Быстрые и дешёвые модели для служебных решений (стоит ли отвечать, какую реакцию ставить)
+LIGHT_MODELS = [
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-2.5-flash",
 ]
 # Сколько истории чата получает бот при ответе: сутки, до 60 сообщений, с метками времени.
 # Раньше было 6 сообщений за последний час — отсюда «память как у золотой рыбки».
@@ -99,6 +103,7 @@ async def call_gemini_safe(
     contents,
     config: genai_types.GenerateContentConfig | None = None,
     timeout: float = 12.0,
+    models: list[str] | None = None,
 ):
     """
     Быстрый и безопасный вызов Gemini API:
@@ -107,18 +112,19 @@ async def call_gemini_safe(
     - Кулдаун 5 минут для перегруженных моделей и запоминание самой быстрой рабочей модели
     """
     now = time.monotonic()
+    priority = models or _MODELS_PRIORITY
 
     # Всегда идём по приоритету: сильная модель первой, слабые — только как запасные.
     # Раньше «запоминалась» последняя успешная модель, и после одного сбоя бот надолго
     # застревал на самой слабой (flash-lite) — отсюда «тупизм» в ответах.
     candidates = [
-        m for m in _MODELS_PRIORITY
+        m for m in priority
         if m not in _DEAD_MODELS and _COOLDOWN_UNTIL.get(m, 0.0) <= now
     ]
     if not candidates:
         # Если все в кулдауне — сбрасываем кулдауны и пробуем живые модели
         _COOLDOWN_UNTIL.clear()
-        candidates = [m for m in _MODELS_PRIORITY if m not in _DEAD_MODELS] or list(_MODELS_PRIORITY)
+        candidates = [m for m in priority if m not in _DEAD_MODELS] or list(priority)
 
     for model in candidates:
         try:
@@ -235,77 +241,6 @@ async def update_long_memory() -> bool:
     return True
 
 
-async def ask_wisdom(
-    user_question: str,
-    user: types.User | None = None,
-    reply_quote: str | None = None,
-) -> str:
-    user_name = user.first_name if user and user.first_name else "Участник"
-    username_tag = f"@{user.username}" if user and user.username else user_name
-    user_profile = get_user_context(user)
-    q_lower = user_question.lower()
-
-    combined_query_check = q_lower + (" " + reply_quote.lower() if reply_quote else "")
-    needs_weather = any(word in combined_query_check for word in WEATHER_KEYWORDS)
-
-    # Параллельно запрашиваем историю чата и погоду (если нужно)
-    if needs_weather:
-        weather_query = (
-            user_question
-            if any(w in q_lower for w in WEATHER_DIRECT_KEYWORDS)
-            else (reply_quote or user_question)
-        )
-        recent_dialogue, forecast_data = await asyncio.gather(
-            get_recent_messages(**_CHAT_MEMORY),
-            fetch_dynamic_weather(weather_query, user),
-        )
-        weather_context = (
-            f"\n\n[РЕАЛЬНАЯ ТОЧНАЯ МЕТЕОСВОДКА ИЗ МЕТЕОСЛУЖБЫ]:\n"
-            f"{forecast_data}\n"
-            f"СТРОГО ОБЯЗАТЕЛЬНО используй эти ТОЧНЫЕ цифры (температуру, ветер, осадки) для ответа! "
-            f"Отвечай конкретно по той локации, которая указана в сводке (не приплетай другие города!)."
-        )
-    else:
-        recent_dialogue = await get_recent_messages(**_CHAT_MEMORY)
-        weather_context = ""
-
-    reply_context_str = (
-        f"\n[{user_name.upper()} ОТВЕЧАЕТ НА ЭТУ РЕПЛИКУ]: {reply_quote}\n"
-        if reply_quote
-        else ""
-    )
-
-    memory_text = await get_memory_context()
-    memory_block = (
-        "[ДОЛГАЯ ПАМЯТЬ О КОМПАНИИ: накопленные заметки о людях и прошлых темах. "
-        f"Используй как фон, не пересказывай без нужды]:\n{memory_text}\n\n"
-        if memory_text
-        else ""
-    )
-
-    prompt = (
-        f"[КОНТЕКСТ СОБЕСЕДНИКА]: {user_profile}\n\n"
-        f"{memory_block}"
-        "[ИСТОРИЯ ЧАТА ЗА СУТКИ, от старых сообщений к новым. Твои реплики подписаны "
-        f"«Мудрец Мяумяура». Последняя строка — сообщение, на которое ты отвечаешь]:\n{recent_dialogue}\n"
-        f"{reply_context_str}"
-        f"{weather_context}\n\n"
-        f'Сейчас тебе пишет {user_name} ({username_tag}): "{user_question}"\n\n'
-        "Ответь именно на это сообщение, опираясь на историю: помни, о чём говорили раньше и кто что сказал, "
-        "не повторяйся и не противоречь себе. "
-        "Если сообщение короткое или шуточное — отвечай коротко (1–2 фразы). "
-        "Если нужно что-то объяснить или посоветовать — до 5 предложений. "
-        "Без лести, по-человечески, с юмором к месту. Факты не выдумывай: не знаешь — скажи прямо."
-    )
-
-    try:
-        response = await call_gemini_safe(contents=prompt, config=_CFG_WISDOM_06)
-        return response.text.strip()
-    except Exception as e:
-        logging.error(f"Gemini вопрос ошибка: {e}")
-        return "Я рядом, но связь чуть сбоит. Выдохни и переспроси через пару секунд."
-
-
 async def fact_check_dispute(query: str) -> str:
     """Фактчекер споров через Gemini с выходом в поиск."""
     prompt = (
@@ -371,34 +306,6 @@ async def fetch_url_metadata(url: str) -> str:
         logging.warning(f"Не удалось вытащить метаданные ссылки ({url}): {e}")
 
     return ""
-
-
-async def summarize_media_url(url: str, user: types.User | None = None) -> str:
-    """Быстрый пересказ ссылок (YouTube, статьи, посты)."""
-    meta_info = await fetch_url_metadata(url)
-    user_profile = get_user_context(user)
-
-    if meta_info:
-        prompt = (
-            f"[КОНТЕКСТ СОБЕСЕДНИКА]: {user_profile}\n"
-            f"Пользователь прислал ссылку: {url}\n"
-            f"Вот реальные данные о содержании этой страницы/видео:\n{meta_info}\n\n"
-            "Сделай краткий, живой пересказ (1-2 ёмких предложения), в чём суть материала, "
-            "и вынеси вердикт в своём стиле: стоит ли тратить время или это проходняк."
-        )
-    else:
-        prompt = (
-            f"[КОНТЕКСТ СОБЕСЕДНИКА]: {user_profile}\n"
-            f"Пользователь прислал ссылку: {url}\n"
-            "Попробуй определить суть по ссылке и вынеси краткий вердикт (1-2 предложения)."
-        )
-
-    try:
-        response = await call_gemini_safe(contents=prompt, config=_CFG_WISDOM_06)
-        return response.text.strip()
-    except Exception as e:
-        logging.error(f"Ошибка пересказа ссылки: {e}")
-        return "Ссылка не открывается или закрыта от посторонних глаз."
 
 
 async def analyze_visual_media(
@@ -556,35 +463,3 @@ async def generate_weekly_digest() -> str:
     except Exception as e:
         logging.error(f"Ошибка недели: {e}")
         return "Неделя прошла так стремительно, что даже мудрец не успел её осмыслить."
-
-
-async def maybe_join_conversation(last_user: types.User | None = None) -> str:
-    """Анализирует контекст беседы и решает, стоит ли вклиниться в разговор как живой друг."""
-    chat = await get_recent_messages(hours=6, limit=30, with_time=True, max_chars=5000)
-    if chat == "В чате было спокойно.":
-        return ""
-
-    user_name = last_user.first_name if last_user and last_user.first_name else "Участник"
-    username_tag = f"@{last_user.username}" if last_user and last_user.username else user_name
-
-    memory_text = await get_memory_context()
-    memory_block = f"Долгая память о компании (фон):\n{memory_text}\n\n" if memory_text else ""
-
-    prompt = f"""
-{memory_block}Вот последние сообщения в чате:
-{chat}
-
-Ты собираешься отреагировать на реплику пользователя {user_name} ({username_tag}).
-1. Вникни в суть разговора и ответь уверенно, по-пацански и без подхалимажа, помня роли каждого в банде (Захар — главный кент, Паша — свой кент, недавно дембельнулся и уже дома, Илья — нефтяник для подколов).
-2. Если уместно органично подключиться — напиши 1–2 живых предложения.
-3. Если разговор сугубо личный, тема не располагает к вмешательству или сказать нечего — напиши строго одно слово: SKIP
-"""
-    try:
-        response = await call_gemini_safe(contents=prompt, config=_CFG_WISDOM_08)
-        text = response.text.strip()
-        if "SKIP" in text or not text:
-            return ""
-        return text
-    except Exception as e:
-        logging.error(f"Ошибка спонтанного комментария: {e}")
-        return ""
