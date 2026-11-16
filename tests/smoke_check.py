@@ -387,6 +387,36 @@ async def check_fun_with_db() -> None:
     print("fun with db OK")
 
 
+def check_brain_power() -> None:
+    """Модели и настройки размышлений подгоняются под каждую модель."""
+    assert ai_service._MODELS_PRIORITY[0] == "gemini-3.8-flash"
+    assert "gemini-2.0-flash" not in ai_service._MODELS_PRIORITY + ai_service.LIGHT_MODELS
+
+    assert ai_service.supports_thinking_level("gemini-3.8-flash")
+    assert not ai_service.supports_thinking_level("gemini-3.5-flash-lite")
+    assert not ai_service.supports_thinking_level("gemini-2.5-flash")
+
+    cfg = genai_types.GenerateContentConfig(temperature=0.7, thinking_config=ai_service.thinking("medium"))
+    on_g3 = ai_service.config_for_model(cfg, "gemini-3.8-flash")
+    assert on_g3.thinking_config is not None and on_g3.temperature is None
+    on_lite = ai_service.config_for_model(cfg, "gemini-3.5-flash-lite")
+    assert on_lite.thinking_config is None and on_lite.temperature is None
+    on_25 = ai_service.config_for_model(cfg, "gemini-2.5-flash")
+    assert on_25.thinking_config is None and on_25.temperature == 0.7
+    assert cfg.thinking_config is not None and cfg.temperature == 0.7, "исходный конфиг не меняется"
+    assert ai_service.config_for_model(None, "gemini-3.8-flash") is None
+    plain = genai_types.GenerateContentConfig(system_instruction="x")
+    assert ai_service.config_for_model(plain, "gemini-2.5-flash") is plain
+
+    assert ai_service.classify_gemini_error(_ApiError(403)) == "dead"
+
+    import os
+    os.environ["TEST_MODELS"] = " a , b ,, "
+    assert ai_service._models_from_env("TEST_MODELS", ["x"]) == ["a", "b"]
+    assert ai_service._models_from_env("MISSING_MODELS_VAR", ["x"]) == ["x"]
+    print("brain power OK")
+
+
 async def check_database() -> None:
     backend = "postgres" if config.DATABASE_URL else "sqlite"
     await database.init_db()
@@ -426,4 +456,5 @@ if __name__ == "__main__":
     check_reply_quote()
     check_brain_pure()
     check_fun_pure()
+    check_brain_power()
     asyncio.run(check_database())

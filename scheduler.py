@@ -114,11 +114,11 @@ def setup_scheduler(bot: Bot) -> None:
         coalesce=True,
     )
 
-    # Каждый день 05:30 Иркутск — обновление долгой памяти бота по вчерашней переписке
+    # 05:30 и 17:30 Иркутск — обновление долгой памяти бота по переписке за сутки
     scheduler.add_job(
         update_long_memory,
         "cron",
-        hour=5,
+        hour="5,17",  # дважды в день: заметки свежее, бот быстрее «узнаёт» новое
         minute=30,
         id="memory_update",
         replace_existing=True,

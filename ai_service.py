@@ -2,6 +2,7 @@ import asyncio
 import html
 import json
 import logging
+import os
 import random
 import re
 from datetime import datetime, timedelta
@@ -38,18 +39,64 @@ class DailyPostSchema(BaseModel):
 
 import time
 
-_MODELS_PRIORITY = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-3-flash-preview",
-]
+def _models_from_env(name: str, default: list[str]) -> list[str]:
+    """Список моделей можно поменять переменной окружения (через запятую) без правки кода."""
+    raw = os.getenv(name, "")
+    models = [m.strip() for m in raw.split(",") if m.strip()]
+    return models or default
+
+
+# Актуально на ноябрь 2026: gemini-2.0-flash уже выключен, gemini-2.5-flash выключают 1 декабря 2026.
+# Основная — gemini-3.8-flash (стабильная, умеет инструменты, поиск, фото, видео и аудио).
+_MODELS_PRIORITY = _models_from_env(
+    "GEMINI_MODELS",
+    [
+        "gemini-3.8-flash",
+        "gemini-3.6-flash",
+        "gemini-2.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-2.5-flash-lite",
+    ],
+)
 # Быстрые и дешёвые модели для служебных решений (стоит ли отвечать, какую реакцию ставить)
-LIGHT_MODELS = [
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
-    "gemini-2.5-flash",
-]
+LIGHT_MODELS = _models_from_env(
+    "GEMINI_LIGHT_MODELS",
+    [
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-2.5-flash-lite",
+        "gemini-3.6-flash",
+    ],
+)
+
+
+def supports_thinking_level(model: str) -> bool:
+    """thinking_level понимают полноценные модели Gemini 3.x; lite и 2.5 получают запрос без него."""
+    return model.startswith("gemini-3") and "lite" not in model
+
+
+def config_for_model(
+    config: genai_types.GenerateContentConfig | None, model: str
+) -> genai_types.GenerateContentConfig | None:
+    """Подгоняет настройки под модель.
+
+    - thinking_level убирается у моделей, которые его не понимают (иначе ошибка 400);
+    - у Gemini 3 температура остаётся по умолчанию (1.0): Google предупреждает, что
+      пониженная температура у этих моделей ухудшает ответы и вызывает зацикливание.
+    """
+    if config is None:
+        return None
+    updates: dict = {}
+    if config.thinking_config is not None and not supports_thinking_level(model):
+        updates["thinking_config"] = None
+    if model.startswith("gemini-3") and config.temperature is not None:
+        updates["temperature"] = None
+    return config.model_copy(update=updates) if updates else config
+
+
+def thinking(level: str) -> genai_types.ThinkingConfig:
+    """Глубина размышлений модели: low — быстро, medium — баланс, high — максимум ума."""
+    return genai_types.ThinkingConfig(thinking_level=level)
 # Сколько истории чата получает бот при ответе: сутки, до 60 сообщений, с метками времени.
 # Раньше было 6 сообщений за последний час — отсюда «память как у золотой рыбки».
 _CHAT_MEMORY = {"hours": 24, "limit": 60, "with_time": True, "max_chars": 9000}
@@ -69,6 +116,7 @@ _CFG_WISDOM_03_SEARCH = genai_types.GenerateContentConfig(
     temperature=0.3,
     system_instruction=WISDOM_SYSTEM_INSTRUCTION,
     tools=[{"google_search": {}}],
+    thinking_config=thinking("high"),  # спор разруливаем с максимальной вдумчивостью
 )
 _CFG_WISDOM_06 = genai_types.GenerateContentConfig(
     temperature=0.6,
@@ -82,7 +130,7 @@ _CFG_WISDOM_08 = genai_types.GenerateContentConfig(
     temperature=0.8,
     system_instruction=WISDOM_SYSTEM_INSTRUCTION,
 )
-_CFG_MEMORY = genai_types.GenerateContentConfig(temperature=0.2)
+_CFG_MEMORY = genai_types.GenerateContentConfig(temperature=0.2, thinking_config=thinking("high"))
 _CFG_DAILY_JSON = genai_types.GenerateContentConfig(
     temperature=0.8,
     system_instruction=WISDOM_SYSTEM_INSTRUCTION,
@@ -107,14 +155,14 @@ _META_DESC_RE = re.compile(
 
 
 def classify_gemini_error(e: Exception) -> str:
-    """dead — модели нет (404), overloaded — лимит или перегрузка (429/5xx), other — прочее.
+    """dead — модели нет или нет доступа (403/404), overloaded — лимит или перегрузка (429/5xx), other — прочее.
 
     Сначала смотрим на HTTP-код из ошибки SDK (у google-genai он в поле code),
     и только если его нет — на текст, как раньше.
     """
     code = getattr(e, "code", None)
     if isinstance(code, int):
-        if code == 404:
+        if code in (403, 404):  # модели нет или она недоступна этому ключу
             return "dead"
         if code == 429 or 500 <= code < 600:
             return "overloaded"
@@ -141,6 +189,7 @@ async def call_gemini_safe(
     """
     now = time.monotonic()
     priority = models or _MODELS_PRIORITY
+    base_config = config
 
     # Всегда идём по приоритету: сильная модель первой, слабые — только как запасные.
     # Раньше «запоминалась» последняя успешная модель, и после одного сбоя бот надолго
@@ -157,6 +206,7 @@ async def call_gemini_safe(
     for model in candidates:
         try:
             kwargs = {"model": model, "contents": contents}
+            config = config_for_model(base_config, model)
             if config:
                 kwargs["config"] = config
 
@@ -274,10 +324,10 @@ async def fact_check_dispute(query: str) -> str:
     )
     try:
         try:
-            response = await call_gemini_safe(contents=prompt, config=_CFG_WISDOM_03_SEARCH)
+            response = await call_gemini_safe(contents=prompt, config=_CFG_WISDOM_03_SEARCH, timeout=35.0)
             return response.text.strip()
         except Exception:
-            response = await call_gemini_safe(contents=prompt, config=_CFG_WISDOM_03)
+            response = await call_gemini_safe(contents=prompt, config=_CFG_WISDOM_03, timeout=25.0)
             return response.text.strip()
     except Exception as e:
         logging.error(f"Ошибка фактчека: {e}")
