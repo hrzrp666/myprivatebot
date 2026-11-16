@@ -2,46 +2,44 @@ import asyncio
 import html
 import io
 import logging
-import random
 import re
 from datetime import datetime, timedelta
 from aiogram import Bot, F, Router, types
 from aiogram.enums import ChatAction
 from aiogram.filters import Command
-from aiogram.types import BufferedInputFile
+from aiogram.types import BufferedInputFile, ReactionTypeEmoji
 
 from ai_service import (
     add_manual_fact,
     analyze_visual_media,
-    ask_wisdom,
     check_ilya_ponto_radar,
     clear_memory,
     fact_check_dispute,
     generate_summary,
     get_memory_context,
-    maybe_join_conversation,
-    summarize_media_url,
     transcribe_voice_bytes,
     update_long_memory,
 )
-from config import (
-    ADMIN_ID,
-    CHAT_ID,
-    LINK_TRIGGER_KEYWORDS,
-    TZ,
-    VISION_TRIGGER_KEYWORDS,
-    VOICE_TRIGGER_KEYWORDS,
-)
+from brain import BotReply, ask_wisdom, decide_engagement
+from config import ADMIN_ID, BOT_NAME, CHAT_ID, TZ, VISION_TRIGGER_KEYWORDS
 from database import save_message
 from scheduler import create_daily_post
+from stickers import remember_sticker
 from tts import text_to_speech_bytes
 
 router = Router()
 
 _bot_info: types.User | None = None
 _bot_info_lock = asyncio.Lock()
-_last_random_comment_time = datetime.min.replace(tzinfo=TZ)
-_URL_RE = re.compile(r"https?://\S+")
+
+# Ограничители, чтобы бот не превратился в спамера и не жёг лимит Gemini
+_DECISION_GAP = timedelta(seconds=15)     # не чаще одного решения «реагировать ли» в 15 с
+_SPONTANEOUS_GAP = timedelta(minutes=10)  # сам вклинивается не чаще раза в 10 минут
+_REACTION_GAP = timedelta(seconds=90)     # сам ставит реакции не чаще раза в полторы минуты
+_NEVER = datetime.min.replace(tzinfo=TZ)
+_last_decision_time = _NEVER
+_last_spontaneous_time = _NEVER
+_last_reaction_time = _NEVER
 
 
 async def get_bot_info(bot: Bot) -> types.User:
@@ -54,6 +52,12 @@ async def get_bot_info(bot: Bot) -> types.User:
     return _bot_info
 
 
+def _sender_name(message: types.Message) -> str:
+    if message.from_user and message.from_user.first_name:
+        return message.from_user.first_name
+    return "Участник"
+
+
 def _format_reply_quote(reply: types.Message | None, bot_info: types.User) -> str | None:
     """Текст сообщения, на которое отвечают, с указанием автора (иначе модель путает, кто что сказал)."""
     if not reply:
@@ -62,7 +66,7 @@ def _format_reply_quote(reply: types.Message | None, bot_info: types.User) -> st
     if not text:
         return None
     if reply.from_user and reply.from_user.id == bot_info.id:
-        author = "Мудрец Мяумяура"
+        author = BOT_NAME
     elif reply.from_user and reply.from_user.first_name:
         author = reply.from_user.first_name
     else:
@@ -70,8 +74,10 @@ def _format_reply_quote(reply: types.Message | None, bot_info: types.User) -> st
     return f"[{author}]: {text[:500]}"
 
 
+# Явное обращение — отвечаем без раздумий. Слово «бот» и косвенные обращения
+# решает лёгкая модель (раньше любое «бот» в тексте вызывало ответ невпопад).
 _BOT_NAME_TRIGGERS = ("мяумяур", "мудрец")
-_BOT_WORD_RE = re.compile(r"\bбот\b", re.IGNORECASE)
+_BOT_WORD_RE = re.compile(r"(?<![а-яa-z])бот(?![а-яa-z])")
 
 
 def _is_addressed_to_bot(
@@ -85,7 +91,7 @@ def _is_addressed_to_bot(
         and message.reply_to_message.from_user
         and message.reply_to_message.from_user.id == bot_info.id
     )
-    if is_reply or any(t in text_lower for t in _BOT_NAME_TRIGGERS) or _BOT_WORD_RE.search(text_lower):
+    if is_reply or any(t in text_lower for t in _BOT_NAME_TRIGGERS):
         return True
 
     bot_username = (bot_info.username or "").lower()
@@ -96,6 +102,83 @@ def _is_addressed_to_bot(
         return True
 
     return False
+
+
+async def send_bot_reply(message: types.Message, bot: Bot, reply: BotReply) -> None:
+    """Отправляет всё, что решила модель: реакцию, текст или голосовое, стикер."""
+    if reply.reaction:
+        try:
+            await message.react([ReactionTypeEmoji(emoji=reply.reaction)])
+        except Exception as e:
+            logging.warning(f"Реакция не поставилась: {e}")
+
+    if reply.text:
+        text = reply.text[:3900]
+        await save_message(BOT_NAME, text)
+        sent_as_voice = False
+        if reply.voice:
+            await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.RECORD_VOICE)
+            audio_bytes = await text_to_speech_bytes(text)
+            if audio_bytes:
+                voice_file = BufferedInputFile(audio_bytes, filename="wisdom.mp3")
+                await message.reply_voice(voice=voice_file, caption=f"🧙 {html.escape(text[:900])}")
+                sent_as_voice = True
+        if not sent_as_voice:
+            await message.reply(f"🧙 {html.escape(text)}")
+
+    if reply.sticker_file_id:
+        try:
+            await message.reply_sticker(reply.sticker_file_id)
+            if not reply.text:
+                await save_message(BOT_NAME, "[стикер]")
+        except Exception as e:
+            logging.warning(f"Стикер не отправился: {e}")
+
+
+async def _answer(
+    message: types.Message, bot: Bot, text: str, bot_info: types.User, spontaneous: bool = False
+) -> None:
+    await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+    reply_quote = _format_reply_quote(message.reply_to_message, bot_info)
+    reply = await ask_wisdom(text, message.from_user, reply_quote, spontaneous=spontaneous)
+    if not reply.is_empty:
+        await send_bot_reply(message, bot, reply)
+
+
+async def respond_to_text(message: types.Message, bot: Bot, text: str) -> None:
+    """Общая логика для текста и расшифрованных голосовых: ответить, поставить реакцию или промолчать."""
+    global _last_decision_time, _last_spontaneous_time, _last_reaction_time
+
+    bot_info = await get_bot_info(bot)
+    text_lower = text.lower()
+    if _is_addressed_to_bot(message, bot_info, text_lower):
+        await _answer(message, bot, text, bot_info)
+        return
+
+    now = datetime.now(TZ)
+    mentions_bot = bool(_BOT_WORD_RE.search(text_lower))
+    if not mentions_bot and now - _last_decision_time < _DECISION_GAP:
+        return
+    _last_decision_time = now
+
+    minutes_since = (
+        None if _last_spontaneous_time == _NEVER
+        else (now - _last_spontaneous_time).total_seconds() / 60
+    )
+    decision = await decide_engagement(minutes_since)
+
+    if decision.action == "reply":
+        if decision.addressed:
+            await _answer(message, bot, text, bot_info)
+        elif now - _last_spontaneous_time > _SPONTANEOUS_GAP:
+            _last_spontaneous_time = now
+            await _answer(message, bot, text, bot_info, spontaneous=True)
+    elif decision.action == "react" and now - _last_reaction_time > _REACTION_GAP:
+        _last_reaction_time = now
+        try:
+            await message.react([ReactionTypeEmoji(emoji=decision.emoji)])
+        except Exception as e:
+            logging.warning(f"Реакция не поставилась: {e}")
 
 
 # =====================================================
@@ -112,7 +195,9 @@ async def start_cmd(message: types.Message) -> None:
         "• /пробей &lt;вопрос&gt; — Разрулить любой спор по фактам с пруфами\n"
         "• /memory — Что я помню о вас, /remember &lt;факт&gt; — запомнить вручную\n"
         "• Каждое воскресенье в 20:00 — Итоги недели\n"
-        "• Кидай голосовые (я расшифрую) и фотки/кружочки (я заценю)!"
+        "• Кидай голосовые (я расшифрую) и фотки/кружочки (я заценю)!\n"
+        "• Зови «Мяумяура …»: сам гляну погоду, поищу в интернете, открою ссылку, запомню важное, "
+        "отвечу голосом или стикером. Иногда сам вклиниваюсь и ставлю реакции."
     )
 
 
@@ -225,20 +310,16 @@ async def probe_cmd(message: types.Message, bot: Bot) -> None:
 
 
 # =====================================================
-# MEDIA & VOICE HANDLERS
+# MEDIA, VOICE & STICKERS
 # =====================================================
 
 @router.message(F.voice)
 async def handle_voice_message(message: types.Message, bot: Bot) -> None:
-    """Моментальная расшифровка голосовых сообщений."""
+    """Расшифровка голосовых; дальше голосовое обрабатывается как обычный текст."""
     if message.chat.id != CHAT_ID or not message.voice:
         return
 
-    username = (
-        message.from_user.first_name
-        if message.from_user and message.from_user.first_name
-        else "Участник"
-    )
+    username = _sender_name(message)
     try:
         file = await bot.get_file(message.voice.file_id)
         voice_buffer = io.BytesIO()
@@ -252,13 +333,7 @@ async def handle_voice_message(message: types.Message, bot: Bot) -> None:
         await message.reply(
             f"🗣 <b>{html.escape(username)}</b> (расшифровка):\n<i>«{html.escape(transcribed)}»</i>"
         )
-
-        bot_info = await get_bot_info(bot)
-        if _is_addressed_to_bot(message, bot_info, transcribed.lower()):
-            await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-            answer = await ask_wisdom(transcribed, message.from_user)
-            await save_message("Мудрец Мяумяура", answer)
-            await message.answer(f"🧙 {html.escape(answer)}")
+        await respond_to_text(message, bot, transcribed)
     except Exception as e:
         logging.error(f"Ошибка обработки войса: {e}")
 
@@ -269,11 +344,7 @@ async def handle_media_vision(message: types.Message, bot: Bot) -> None:
     if message.chat.id != CHAT_ID:
         return
 
-    username = (
-        message.from_user.first_name
-        if message.from_user and message.from_user.first_name
-        else "Участник"
-    )
+    username = _sender_name(message)
     caption = message.caption or ""
     bot_info = await get_bot_info(bot)
 
@@ -298,9 +369,25 @@ async def handle_media_vision(message: types.Message, bot: Bot) -> None:
             media_buffer.getvalue(), mime, caption, message.from_user
         )
         await message.reply(f"🧙 {html.escape(comment)}")
-        await save_message(username, f"[Медиа]: {caption} (Бот: {comment})")
+        await save_message(username, f"[Медиа]: {caption}")
+        await save_message(BOT_NAME, comment)
     except Exception as e:
         logging.error(f"Ошибка Vision: {e}")
+
+
+@router.message(F.sticker)
+async def handle_sticker(message: types.Message) -> None:
+    """Запоминает стикеры друзей, чтобы бот потом мог отвечать ими сам."""
+    if message.chat.id != CHAT_ID or not message.sticker:
+        return
+    if message.from_user and message.from_user.is_bot:
+        return
+    sticker = message.sticker
+    try:
+        await remember_sticker(sticker.file_id, sticker.file_unique_id, sticker.emoji)
+        await save_message(_sender_name(message), f"[Стикер {sticker.emoji or ''}]".replace(" ]", "]"))
+    except Exception as e:
+        logging.warning(f"Не удалось сохранить стикер: {e}")
 
 
 # =====================================================
@@ -309,68 +396,23 @@ async def handle_media_vision(message: types.Message, bot: Bot) -> None:
 
 @router.message(F.text)
 async def collect(message: types.Message, bot: Bot) -> None:
-    global _last_random_comment_time
-
     if message.chat.id != CHAT_ID or not message.text or message.text.startswith("/"):
         return
     if message.from_user and message.from_user.is_bot:
         return
 
-    username = (
-        message.from_user.first_name
-        if message.from_user and message.from_user.first_name
-        else "Участник"
-    )
-    text_lower = message.text.lower()
-
+    username = _sender_name(message)
     try:
         await save_message(username, message.text)
         # Текст личной переписки в логи не пишем, только факт сообщения
         logging.info(f"Сообщение от {username} ({len(message.text)} симв.)")
 
-        # 1. Радар понтов для Ильи
+        # Радар понтов для Ильи
         ponto_alert = await check_ilya_ponto_radar(message)
         if ponto_alert:
             await message.reply(ponto_alert)
             return
 
-        # 2. Быстрый пересказ ссылок
-        url_match = _URL_RE.search(message.text)
-        if url_match and any(w in text_lower for w in LINK_TRIGGER_KEYWORDS):
-            await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-            summary_link = await summarize_media_url(url_match.group(0), message.from_user)
-            await save_message("Мудрец Мяумяура", summary_link)
-            await message.reply(f"🎬 <b>Суть ссылки:</b>\n{html.escape(summary_link)}")
-            return
-
-        # 3. Прямое обращение (по имени «мяумяура», тегу или Reply)
-        bot_info = await get_bot_info(bot)
-        if _is_addressed_to_bot(message, bot_info, text_lower):
-            await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-            reply_quote = _format_reply_quote(message.reply_to_message, bot_info)
-            answer = await ask_wisdom(message.text, message.from_user, reply_quote)
-            await save_message("Мудрец Мяумяура", answer)
-
-            # Голосовой ответ по прямой просьбе
-            if any(w in text_lower for w in VOICE_TRIGGER_KEYWORDS):
-                await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.RECORD_VOICE)
-                audio_bytes = await text_to_speech_bytes(answer)
-                if audio_bytes:
-                    voice_file = BufferedInputFile(audio_bytes, filename="wisdom.mp3")
-                    await message.reply_voice(voice=voice_file, caption=f"🧙 {html.escape(answer)}")
-                    return
-
-            await message.reply(f"🧙 {html.escape(answer)}")
-            return
-
-        # 4. Спонтанное вклинивание в диалог (шанс 10%, не чаще раза в 10 минут)
-        now = datetime.now(TZ)
-        if (now - _last_random_comment_time) > timedelta(minutes=10) and random.random() < 0.10:
-            remark = await maybe_join_conversation(message.from_user)
-            if remark:
-                _last_random_comment_time = now
-                await save_message("Мудрец Мяумяура", remark)
-                await message.reply(f"🧙 {html.escape(remark)}")
-
+        await respond_to_text(message, bot, message.text)
     except Exception as e:
         logging.error(f"Ошибка обработки сообщения: {e}")

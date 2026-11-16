@@ -138,18 +138,10 @@ async def save_message(username: str, text: str) -> None:
         await _db_conn.commit()
 
 
-async def get_recent_messages(
-    hours: int = 24,
-    limit: int = 300,
-    with_time: bool = False,
-    max_chars: int = 8000,
-) -> str:
-    """История чата строками «[Имя]: текст» от старых к новым.
-
-    with_time=True добавляет метку «[дд.мм чч:мм]», чтобы модель понимала, когда что было сказано.
-    """
+async def get_recent_rows(hours: int = 24, limit: int = 60) -> list[tuple[str, str, datetime]]:
+    """Последние сообщения как (имя, текст, время) от старых к новым — для диалога с моделью."""
     if not _is_ready():
-        return "В чате было спокойно."
+        return []
 
     limit_dt = datetime.now(TZ) - timedelta(hours=hours)
     if _pool is not None:
@@ -179,11 +171,24 @@ async def get_recent_messages(
             raw_rows = await cursor.fetchall()
         rows = [(u, t, datetime.fromisoformat(c)) for u, t, c in raw_rows]
 
+    rows.reverse()
+    return rows
+
+
+async def get_recent_messages(
+    hours: int = 24,
+    limit: int = 300,
+    with_time: bool = False,
+    max_chars: int = 8000,
+) -> str:
+    """История чата строками «[Имя]: текст» от старых к новым.
+
+    with_time=True добавляет метку «[дд.мм чч:мм]», чтобы модель понимала, когда что было сказано.
+    """
+    rows = await get_recent_rows(hours=hours, limit=limit)
     if not rows:
         return "В чате было спокойно."
 
-    rows = list(rows)
-    rows.reverse()
     if with_time:
         lines = [
             f"[{created.astimezone(TZ).strftime('%d.%m %H:%M')}] [{user}]: {text}"
