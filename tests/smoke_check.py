@@ -4,14 +4,34 @@
 и при желании DATABASE_URL (Postgres), затем: python tests/smoke_check.py
 """
 import asyncio
+import re
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config  # noqa: E402
 import database  # noqa: E402
+import handlers  # noqa: E402
 import weather  # noqa: E402
+
+
+def check_reply_quote() -> None:
+    bot_info = SimpleNamespace(id=1)
+
+    def quote(text, user_id, first_name):
+        msg = SimpleNamespace(
+            text=text, caption=None, from_user=SimpleNamespace(id=user_id, first_name=first_name)
+        )
+        return handlers._format_reply_quote(msg, bot_info)
+
+    assert quote("привет", 5, "Захар") == "[Захар]: привет"
+    assert quote("ответ бота", 1, None) == "[Мудрец Мяумяура]: ответ бота"
+    assert handlers._format_reply_quote(None, bot_info) is None
+    empty = SimpleNamespace(text=None, caption=None, from_user=None)
+    assert handlers._format_reply_quote(empty, bot_info) is None
+    print("reply quote OK")
 
 
 def check_weather_logic() -> None:
@@ -48,6 +68,9 @@ async def check_database() -> None:
         # порядок от старых к новым
         assert recent.index("привет") < recent.index("второе")
 
+        timed = await database.get_recent_messages(hours=1, limit=10, with_time=True)
+        assert re.search(r"\[\d{2}\.\d{2} \d{2}:\d{2}\] \[Тест\]: привет", timed), timed
+
         weekly = await database.get_weekly_sampled_messages()
         assert "--- Дата:" in weekly and "второе сообщение" in weekly, weekly
 
@@ -65,4 +88,5 @@ async def check_database() -> None:
 
 if __name__ == "__main__":
     check_weather_logic()
+    check_reply_quote()
     asyncio.run(check_database())

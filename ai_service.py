@@ -39,12 +39,14 @@ _MODELS_PRIORITY = [
     "gemini-2.5-flash-lite",
     "gemini-3-flash-preview",
 ]
+# Сколько истории чата получает бот при ответе: сутки, до 60 сообщений, с метками времени.
+# Раньше было 6 сообщений за последний час — отсюда «память как у золотой рыбки».
+_CHAT_MEMORY = {"hours": 24, "limit": 60, "with_time": True, "max_chars": 9000}
 # Таймаут для тяжёлых запросов с файлами (голосовые, фото, видео-кружки)
 _MEDIA_TIMEOUT = 35.0
 # Мемоизация 404-моделей и временный кулдаун для перегруженных моделей
 _DEAD_MODELS: set[str] = set()
 _COOLDOWN_UNTIL: dict[str, float] = {}
-_preferred_model: str | None = None
 
 # Предварительно созданные конфигурации Gemini (без повторной аллокации Pydantic-объектов)
 _CFG_AUDIO_02 = genai_types.GenerateContentConfig(temperature=0.2)
@@ -103,10 +105,11 @@ async def call_gemini_safe(
     - Мгновенное переключение на следующую модель при 429/503/таймауте
     - Кулдаун 5 минут для перегруженных моделей и запоминание самой быстрой рабочей модели
     """
-    global _preferred_model
     now = time.monotonic()
 
-    # Формируем список доступных моделей, ставя проверенную рабочую модель на первое место
+    # Всегда идём по приоритету: сильная модель первой, слабые — только как запасные.
+    # Раньше «запоминалась» последняя успешная модель, и после одного сбоя бот надолго
+    # застревал на самой слабой (flash-lite) — отсюда «тупизм» в ответах.
     candidates = [
         m for m in _MODELS_PRIORITY
         if m not in _DEAD_MODELS and _COOLDOWN_UNTIL.get(m, 0.0) <= now
@@ -115,10 +118,6 @@ async def call_gemini_safe(
         # Если все в кулдауне — сбрасываем кулдауны и пробуем живые модели
         _COOLDOWN_UNTIL.clear()
         candidates = [m for m in _MODELS_PRIORITY if m not in _DEAD_MODELS] or list(_MODELS_PRIORITY)
-
-    if _preferred_model and _preferred_model in candidates:
-        candidates.remove(_preferred_model)
-        candidates.insert(0, _preferred_model)
 
     for model in candidates:
         try:
@@ -130,7 +129,8 @@ async def call_gemini_safe(
                 gemini.aio.models.generate_content(**kwargs),
                 timeout=timeout,
             )
-            _preferred_model = model
+            if model != candidates[0]:
+                logging.info(f"Ответ дала запасная модель: {model}")
             return response
 
         except asyncio.TimeoutError:
@@ -177,7 +177,7 @@ async def ask_wisdom(
             else (reply_quote or user_question)
         )
         recent_dialogue, forecast_data = await asyncio.gather(
-            get_recent_messages(hours=1, limit=6),
+            get_recent_messages(**_CHAT_MEMORY),
             fetch_dynamic_weather(weather_query, user),
         )
         weather_context = (
@@ -187,23 +187,27 @@ async def ask_wisdom(
             f"Отвечай конкретно по той локации, которая указана в сводке (не приплетай другие города!)."
         )
     else:
-        recent_dialogue = await get_recent_messages(hours=1, limit=6)
+        recent_dialogue = await get_recent_messages(**_CHAT_MEMORY)
         weather_context = ""
 
     reply_context_str = (
-        f"\n[ПОЛЬЗОВАТЕЛЬ ОТВЕЧАЕТ НА ЭТУ РЕПЛИКУ]: '{reply_quote}'\n"
+        f"\n[{user_name.upper()} ОТВЕЧАЕТ НА ЭТУ РЕПЛИКУ]: {reply_quote}\n"
         if reply_quote
         else ""
     )
 
     prompt = (
         f"[КОНТЕКСТ СОБЕСЕДНИКА]: {user_profile}\n\n"
-        f"[ПОСЛЕДНИЕ СООБЩЕНИЯ В ЧАТЕ ДЛЯ ПАМЯТИ И КОНТЕКСТА]:\n{recent_dialogue}\n"
+        "[ИСТОРИЯ ЧАТА ЗА СУТКИ, от старых сообщений к новым. Твои реплики подписаны "
+        f"«Мудрец Мяумяура». Последняя строка — сообщение, на которое ты отвечаешь]:\n{recent_dialogue}\n"
         f"{reply_context_str}"
         f"{weather_context}\n\n"
-        f'Тебе пишет {user_name} ({username_tag}): "{user_question}"\n'
-        "Ответь ему в своём пацанском стиле, строго соблюдая память диалога (понимай о чем шла речь выше, не противоречь себе). "
-        "Никакой лести и подхалимажа! Отвечай уверенно, с юмором и строго по реальным фактам (2-3 предложения)."
+        f'Сейчас тебе пишет {user_name} ({username_tag}): "{user_question}"\n\n'
+        "Ответь именно на это сообщение, опираясь на историю: помни, о чём говорили раньше и кто что сказал, "
+        "не повторяйся и не противоречь себе. "
+        "Если сообщение короткое или шуточное — отвечай коротко (1–2 фразы). "
+        "Если нужно что-то объяснить или посоветовать — до 5 предложений. "
+        "Без лести, по-человечески, с юмором к месту. Факты не выдумывай: не знаешь — скажи прямо."
     )
 
     try:
@@ -468,7 +472,7 @@ async def generate_weekly_digest() -> str:
 
 async def maybe_join_conversation(last_user: types.User | None = None) -> str:
     """Анализирует контекст беседы и решает, стоит ли вклиниться в разговор как живой друг."""
-    chat = await get_recent_messages(hours=1, limit=8)
+    chat = await get_recent_messages(hours=6, limit=30, with_time=True, max_chars=5000)
     if chat == "В чате было спокойно.":
         return ""
 

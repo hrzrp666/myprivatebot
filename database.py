@@ -120,7 +120,16 @@ async def save_message(username: str, text: str) -> None:
         await _db_conn.commit()
 
 
-async def get_recent_messages(hours: int = 24, limit: int = 300) -> str:
+async def get_recent_messages(
+    hours: int = 24,
+    limit: int = 300,
+    with_time: bool = False,
+    max_chars: int = 8000,
+) -> str:
+    """История чата строками «[Имя]: текст» от старых к новым.
+
+    with_time=True добавляет метку «[дд.мм чч:мм]», чтобы модель понимала, когда что было сказано.
+    """
     if not _is_ready():
         return "В чате было спокойно."
 
@@ -128,7 +137,7 @@ async def get_recent_messages(hours: int = 24, limit: int = 300) -> str:
     if _pool is not None:
         records = await _pool.fetch(
             """
-            SELECT username, text
+            SELECT username, text, created
             FROM messages
             WHERE created >= $1
             ORDER BY id DESC
@@ -137,11 +146,11 @@ async def get_recent_messages(hours: int = 24, limit: int = 300) -> str:
             limit_dt,
             limit,
         )
-        rows = [(r["username"], r["text"]) for r in records]
+        rows = [(r["username"], r["text"], r["created"]) for r in records]
     else:
         async with _db_conn.execute(
             """
-            SELECT username, text
+            SELECT username, text, created
             FROM messages
             WHERE created >= ?
             ORDER BY id DESC
@@ -149,15 +158,22 @@ async def get_recent_messages(hours: int = 24, limit: int = 300) -> str:
             """,
             (limit_dt.isoformat(), limit),
         ) as cursor:
-            rows = await cursor.fetchall()
+            raw_rows = await cursor.fetchall()
+        rows = [(u, t, datetime.fromisoformat(c)) for u, t, c in raw_rows]
 
     if not rows:
         return "В чате было спокойно."
 
     rows = list(rows)
     rows.reverse()
-    result = "\n".join(f"[{user}]: {text}" for user, text in rows)
-    return _trim_history(result)
+    if with_time:
+        lines = [
+            f"[{created.astimezone(TZ).strftime('%d.%m %H:%M')}] [{user}]: {text}"
+            for user, text, created in rows
+        ]
+    else:
+        lines = [f"[{user}]: {text}" for user, text, _ in rows]
+    return _trim_history("\n".join(lines), max_chars=max_chars)
 
 
 async def get_weekly_sampled_messages() -> str:
