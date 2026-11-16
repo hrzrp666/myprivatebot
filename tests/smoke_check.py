@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import ai_service  # noqa: E402
 import config  # noqa: E402
 import database  # noqa: E402
 import handlers  # noqa: E402
@@ -56,6 +57,53 @@ def check_weather_logic() -> None:
     print("weather logic OK")
 
 
+class _FakeResponse:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+async def check_long_memory() -> None:
+    """Долгая память: хранилище kv, ручные факты и ежедневное обновление (Gemini подменён заглушкой)."""
+    await database.set_kv("k", "one")
+    await database.set_kv("k", "two")
+    assert await database.get_kv("k") == "two"
+    assert await database.get_kv("missing") == ""
+
+    await ai_service.clear_memory()
+    assert await ai_service.get_memory_context() == ""
+
+    await ai_service.add_manual_fact("Илья вернулся с вахты")
+    assert "Илья вернулся с вахты" in await ai_service.get_memory_context()
+    for i in range(40):  # лимит длины: старые ручные факты вытесняются
+        await ai_service.add_manual_fact(f"факт {i} " + "x" * 250)
+    manual = await database.get_kv(ai_service.MANUAL_FACTS_KEY)
+    assert len(manual) <= 1500 and "факт 39" in manual, len(manual)
+
+    async def fake_good(*args, **kwargs):
+        return _FakeResponse("• Захар живёт в Култуке и любит рыбалку. Илья работает нефтяником.")
+
+    async def fake_short(*args, **kwargs):
+        return _FakeResponse("ок")
+
+    original = ai_service.call_gemini_safe
+    try:
+        ai_service.call_gemini_safe = fake_good
+        assert await ai_service.update_long_memory() is True
+        saved = await database.get_kv(ai_service.MEMORY_KEY)
+        assert "Култуке" in saved
+
+        ai_service.call_gemini_safe = fake_short  # слишком короткий ответ не затирает заметки
+        assert await ai_service.update_long_memory() is False
+        assert await database.get_kv(ai_service.MEMORY_KEY) == saved
+    finally:
+        ai_service.call_gemini_safe = original
+
+    assert "Култуке" in await ai_service.get_memory_context()
+    await ai_service.clear_memory()
+    assert await ai_service.get_memory_context() == ""
+    print("long memory OK")
+
+
 async def check_database() -> None:
     backend = "postgres" if config.DATABASE_URL else "sqlite"
     await database.init_db()
@@ -81,6 +129,8 @@ async def check_database() -> None:
 
         await database.clear_old_messages()
         assert "второе сообщение" in await database.get_recent_messages(hours=1, limit=10)
+
+        await check_long_memory()
     finally:
         await database.close_db()
     print(f"database OK ({backend})")
