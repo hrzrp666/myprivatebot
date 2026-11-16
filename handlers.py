@@ -246,7 +246,8 @@ async def collect(message: types.Message, bot: Bot) -> None:
 
     try:
         await save_message(username, message.text)
-        logging.info(f"{username}: {message.text}")
+        # Текст личной переписки в логи не пишем, только факт сообщения
+        logging.info(f"Сообщение от {username} ({len(message.text)} симв.)")
 
         # 1. Радар понтов для Ильи
         ponto_alert = await check_ilya_ponto_radar(message)

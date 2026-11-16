@@ -5,7 +5,7 @@ from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from ai_service import generate_text, generate_weekly_digest
-from config import CHAT_ID, KULTUK_LAT, KULTUK_LON, SVYATOY_NOS_LAT, SVYATOY_NOS_LON, TZ, TZ_MSK
+from config import CHAT_ID, IRKUTSK_LAT, IRKUTSK_LON, KULTUK_LAT, KULTUK_LON, TZ
 from database import clear_old_messages, save_post_today, was_post_today
 from weather import get_weather_day
 
@@ -20,10 +20,10 @@ async def create_daily_post(bot: Bot, force: bool = False) -> None:
             return
 
         try:
-            data, kultuk, svyatoy = await asyncio.gather(
+            data, kultuk, irkutsk = await asyncio.gather(
                 generate_text(),
                 get_weather_day(KULTUK_LAT, KULTUK_LON, tz=TZ),
-                get_weather_day(SVYATOY_NOS_LAT, SVYATOY_NOS_LON, tz=TZ_MSK),
+                get_weather_day(IRKUTSK_LAT, IRKUTSK_LON, tz=TZ),
             )
 
             safe_holiday = html.escape(data.get("holiday", ""))
@@ -36,10 +36,10 @@ async def create_daily_post(bot: Bot, force: bool = False) -> None:
                 f"🌅 Утро: {kultuk.get('🌅 Утро', 'нет данных')}\n"
                 f"☀️ День: {kultuk.get('☀️ День', 'нет данных')}\n"
                 f"🌆 Вечер: {kultuk.get('🌆 Вечер', 'нет данных')}\n\n"
-                f"🌊 <b>Святой Нос</b>\n"
-                f"🌅 Утро: {svyatoy.get('🌅 Утро', 'нет данных')}\n"
-                f"☀️ День: {svyatoy.get('☀️ День', 'нет данных')}\n"
-                f"🌆 Вечер: {svyatoy.get('🌆 Вечер', 'нет данных')}\n\n"
+                f"🏙 <b>Иркутск</b>\n"
+                f"🌅 Утро: {irkutsk.get('🌅 Утро', 'нет данных')}\n"
+                f"☀️ День: {irkutsk.get('☀️ День', 'нет данных')}\n"
+                f"🌆 Вечер: {irkutsk.get('🌆 Вечер', 'нет данных')}\n\n"
                 f"✨ <b>Мысль дня от Мудреца Мяумяура:</b>\n"
                 f"«{safe_quote}»"
             )
