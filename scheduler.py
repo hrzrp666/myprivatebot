@@ -7,6 +7,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from ai_service import generate_text, generate_weekly_digest, update_long_memory
 from config import CHAT_ID, IRKUTSK_LAT, IRKUTSK_LON, KULTUK_LAT, KULTUK_LON, TZ
 from database import clear_old_messages, save_post_today, was_post_today
+from mood import today_mood
 from weather import get_weather_day
 
 scheduler = AsyncIOScheduler(timezone=TZ)
@@ -28,10 +29,14 @@ async def create_daily_post(bot: Bot, force: bool = False) -> None:
 
             safe_holiday = html.escape(data.get("holiday", ""))
             safe_quote = html.escape(data.get("quote", ""))
+            mood_name, _ = today_mood()
+
+            # Праздник показываем, только если модель его назвала (выдуманных больше нет)
+            holiday_block = f"📅 <b>Сегодня:</b>\n{safe_holiday}\n\n" if safe_holiday else ""
 
             text = (
-                f"📅 <b>Сегодня:</b>\n"
-                f"{safe_holiday}\n\n"
+                f"{holiday_block}"
+                f"🎭 <b>Настроение Мудреца сегодня:</b> {html.escape(mood_name)}\n\n"
                 f"🌤 <b>Култук</b>\n"
                 f"🌅 Утро: {kultuk.get('🌅 Утро', 'нет данных')}\n"
                 f"☀️ День: {kultuk.get('☀️ День', 'нет данных')}\n"

@@ -4,7 +4,7 @@ import json
 import logging
 import random
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 import aiohttp
 from aiogram import types
 from google import genai
@@ -16,9 +16,16 @@ from config import (
     PONT_KEYWORDS,
     TZ,
     WISDOM_SYSTEM_INSTRUCTION,
-    get_user_context,
 )
-from database import get_kv, get_recent_messages, get_weekly_sampled_messages, set_kv
+import cooldowns
+from database import (
+    get_kv,
+    get_recent_messages,
+    get_user_message_counts,
+    get_weekly_sampled_messages,
+    set_kv,
+)
+from mood import today_mood
 from weather import get_http_session
 
 gemini = genai.Client(api_key=GEMINI_KEY)
@@ -99,6 +106,27 @@ _META_DESC_RE = re.compile(
 )
 
 
+def classify_gemini_error(e: Exception) -> str:
+    """dead — модели нет (404), overloaded — лимит или перегрузка (429/5xx), other — прочее.
+
+    Сначала смотрим на HTTP-код из ошибки SDK (у google-genai он в поле code),
+    и только если его нет — на текст, как раньше.
+    """
+    code = getattr(e, "code", None)
+    if isinstance(code, int):
+        if code == 404:
+            return "dead"
+        if code == 429 or 500 <= code < 600:
+            return "overloaded"
+        return "other"
+    text = str(e)
+    if "404" in text or "NOT_FOUND" in text:
+        return "dead"
+    if any(s in text for s in ("429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE", "high demand")):
+        return "overloaded"
+    return "other"
+
+
 async def call_gemini_safe(
     contents,
     config: genai_types.GenerateContentConfig | None = None,
@@ -146,14 +174,11 @@ async def call_gemini_safe(
             # чтобы один медленный запрос не выключал все модели на минуты
             _COOLDOWN_UNTIL[model] = time.monotonic() + 45
         except Exception as e:
-            err_str = str(e)
-            if "404" in err_str or "NOT_FOUND" in err_str:
+            kind = classify_gemini_error(e)
+            if kind == "dead":
                 logging.warning(f"Модель {model} не найдена (404). Исключаем навсегда.")
                 _DEAD_MODELS.add(model)
-            elif any(
-                code in err_str
-                for code in ("429", "RESOURCE_EXHAUSTED", "RESOURCE_EXUSITED", "503", "UNAVAILABLE", "high demand")
-            ):
+            elif kind == "overloaded":
                 logging.warning(f"Gemini лимит/перегрузка ({model}). Мгновенно переключаемся на резервную модель...")
                 _COOLDOWN_UNTIL[model] = time.monotonic() + 300
             else:
@@ -308,32 +333,6 @@ async def fetch_url_metadata(url: str) -> str:
     return ""
 
 
-async def analyze_visual_media(
-    media_bytes: bytes,
-    mime_type: str,
-    caption: str = "",
-    user: types.User | None = None,
-) -> str:
-    """Gemini Vision: анализ фото и кружочков."""
-    user_name = user.first_name if user and user.first_name else "Участник"
-    user_profile = get_user_context(user)
-    prompt = (
-        f"[КОНТЕКСТ СОБЕСЕДНИКА]: {user_profile}\n"
-        f"Тебе прислал медиа-файл {user_name}. "
-        f"Подпись к файлу (если есть): '{caption}'. "
-        "Внимательно посмотри на изображение/видео и прокомментируй по-пацански, с юмором, подколом или респектом (2 предложения)."
-    )
-    try:
-        part = genai_types.Part.from_bytes(data=media_bytes, mime_type=mime_type)
-        response = await call_gemini_safe(
-            contents=[part, prompt], config=_CFG_WISDOM_07, timeout=_MEDIA_TIMEOUT
-        )
-        return response.text.strip()
-    except Exception as e:
-        logging.error(f"Ошибка Vision: {e}")
-        return "Глаза замылились, не смог разобрать картинку. Перешли ещё разок."
-
-
 async def transcribe_voice_bytes(voice_bytes: bytes) -> str:
     """Перевод голосового сообщения в текст через Gemini Audio."""
     prompt = (
@@ -351,36 +350,48 @@ async def transcribe_voice_bytes(voice_bytes: bytes) -> str:
         return ""
 
 
+_PONT_RADAR_GAP = timedelta(minutes=30)
+
+
 async def check_ilya_ponto_radar(message: types.Message) -> str:
-    """Радар понтов и духоты (только для Ильи @Akishinov)."""
+    """Радар понтов: только для Ильи (@Akishinov) и не чаще раза в 30 минут."""
     if not message.from_user:
         return ""
-    username = (message.from_user.username or "").lower()
-    first_name = (message.from_user.first_name or "").lower()
+    if (message.from_user.username or "").lower() != "akishinov":
+        return ""
+    text = message.text or message.caption or ""
+    if not any(k in text.lower() for k in PONT_KEYWORDS):
+        return ""
+    if not await cooldowns.try_acquire("pont_radar", _PONT_RADAR_GAP):
+        return ""
 
-    if username == "akishinov" or "илья" in first_name:
-        text_lower = (message.text or message.caption or "").lower()
-        if any(k in text_lower for k in PONT_KEYWORDS):
-            score = round(random.uniform(7.5, 9.9), 1)
-            prompt = (
-                f"Илья (@Akishinov) написал следующее сообщение: '{message.text}'.\n"
-                f"Радар понтов зафиксировал уровень {score}/10! Приземли его ироничным, смешным и пацанским подколом "
-                "про нефть, баррели, бабло или вахту (строго 1-2 предложения)."
-            )
-            try:
-                response = await call_gemini_safe(contents=prompt, config=_CFG_WISDOM_08)
-                return (
-                    f"🚨 <b>РАДАР ПОНТОВ:</b> Зафиксирован уровень понтов <b>{score}/10</b>!\n\n"
-                    f"🧙 {html.escape(response.text.strip())}"
-                )
-            except Exception as e:
-                logging.error(f"Ошибка радара понтов: {e}")
-    return ""
+    score = round(random.uniform(7.5, 9.9), 1)
+    prompt = (
+        f"Илья (@Akishinov) написал следующее сообщение: '{text}'.\n"
+        f"Радар понтов зафиксировал уровень {score}/10! Приземли его ироничным, смешным и пацанским подколом "
+        "про нефть, баррели, бабло или вахту (строго 1-2 предложения)."
+    )
+    try:
+        response = await call_gemini_safe(contents=prompt, config=_CFG_WISDOM_08)
+        return (
+            f"🚨 <b>РАДАР ПОНТОВ:</b> Зафиксирован уровень понтов <b>{score}/10</b>!\n\n"
+            f"🧙 {html.escape(response.text.strip())}"
+        )
+    except Exception as e:
+        logging.error(f"Ошибка радара понтов: {e}")
+        return ""
+
+
+async def _memory_block(title: str = "Долгая память о компании (фон, не пересказывай целиком)") -> str:
+    memory = await get_memory_context()
+    return f"{title}:\n{memory}\n\n" if memory else ""
 
 
 async def generate_text() -> dict[str, str]:
-    chat = await get_recent_messages()
+    """Мысль дня и праздник для утреннего поста. Праздник пустой, если модель не ответила."""
+    chat, memory_block = await asyncio.gather(get_recent_messages(), _memory_block())
     current_date_str = datetime.now(TZ).strftime("%d.%m.%Y")
+    mood_name, mood_description = today_mood()
 
     prompt = f"""
 Каждое утро создавай короткую мысль дня на основе последних разговоров и указывай праздник.
@@ -388,14 +399,16 @@ async def generate_text() -> dict[str, str]:
 Дата:
 {current_date_str}
 
-История сообщений чата (каждая строка записана в формате [Имя Автора]: сообщение):
+Настроение Мудреца сегодня: «{mood_name}» — {mood_description}. Мысль дня пиши в этом образе.
+
+{memory_block}История сообщений чата (каждая строка записана в формате [Имя Автора]: сообщение):
 {chat}
 
 Правила аналитики текста:
 - В истории разные участники пишут разное. Обращай внимание, КОМУ принадлежит фраза. НЕ смешивай мысли разных авторов в одну проблему.
 
 Правила для JSON полей (СТРОГО):
-- holiday: Напиши исключительно ОФИЦИАЛЬНЫЙ, общеизвестный реальный праздник или памятную дату, которая действительно выпадает на этот день ({current_date_str}) в мире или России. Категорически ЗАПРЕЩЕНО выдумывать шуточные или фейковые праздники на основе контекста разговоров.
+- holiday: Напиши исключительно ОФИЦИАЛЬНЫЙ, общеизвестный реальный праздник или памятную дату, которая действительно выпадает на этот день ({current_date_str}) в мире или России. Категорически ЗАПРЕЩЕНО выдумывать шуточные или фейковые праздники на основе контекста разговоров. Если не уверен — оставь пустую строку.
 - quote: Мудрая очень короткая мысль (1-2 предложения) с лёгким юмором и иронией, которая тонко обыгрывает настроение разговоров.
 
 Дополнительные правила:
@@ -404,26 +417,30 @@ async def generate_text() -> dict[str, str]:
 - не упоминать Telegram, бота или технологии.
 """
     try:
-        response = await call_gemini_safe(contents=prompt, config=_CFG_DAILY_JSON)
+        response = await call_gemini_safe(contents=prompt, config=_CFG_DAILY_JSON, timeout=25.0)
         raw_text = response.text.strip()
         if raw_text.startswith("```"):
             raw_text = raw_text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-        return json.loads(raw_text)
+        data = json.loads(raw_text)
+        return {"holiday": str(data.get("holiday") or "").strip(), "quote": str(data.get("quote") or "").strip()}
     except Exception as e:
         logging.error(f"Gemini ошибка: {e}")
+        # Праздник не выдумываем: без ответа модели строка просто не попадёт в пост
         return {
-            "holiday": "День спокойных решений",
+            "holiday": "",
             "quote": "Даже самый длинный путь начинается с маленького шага, а иногда — с перезапуска утром.",
         }
 
 
 async def generate_summary() -> str:
     """Генерирует краткую выжимку переписки за последние 12 часов."""
-    chat = await get_recent_messages(hours=12, limit=200)
+    chat, memory_block = await asyncio.gather(
+        get_recent_messages(hours=12, limit=200), _memory_block()
+    )
     prompt = f"""
 Посмотри переписку друзей за последнее время и сделай очень краткую, емкую выжимку в 3-4 буллитах (главные темы).
 
-Переписка (формат [Имя Автора]: текст):
+{memory_block}Переписка (формат [Имя Автора]: текст):
 {chat}
 
 Формат ответа:
@@ -431,34 +448,49 @@ async def generate_summary() -> str:
 • Тезис 2
 • Тезис 3
 
-Не используй реальные имена. Напиши лаконично и коротко.
+Выжимка только по переписке, долгая память — лишь для понимания контекста. Не используй реальные имена. Напиши лаконично и коротко.
 """
     try:
-        response = await call_gemini_safe(contents=prompt, config=_CFG_WISDOM_07)
+        response = await call_gemini_safe(contents=prompt, config=_CFG_WISDOM_07, timeout=25.0)
         return response.text.strip()
     except Exception as e:
         logging.error(f"Ошибка создания summary: {e}")
         return "Не удалось разобрать ваши перешёптывания — сервера перегружены."
 
 
+def format_weekly_stats(counts: list[tuple[str, int]]) -> str:
+    """Статистика сообщений за неделю строками «Имя — N сообщ.»."""
+    if not counts:
+        return "За неделю никто ничего не писал."
+    return "\n".join(f"{name} — {count} сообщ." for name, count in counts)
+
+
 async def generate_weekly_digest() -> str:
-    """Дайджест итогов недели."""
-    chat = await get_weekly_sampled_messages()
+    """Дайджест итогов недели с номинациями."""
+    chat, counts, memory_block = await asyncio.gather(
+        get_weekly_sampled_messages(),
+        get_user_message_counts(days=7),
+        _memory_block(),
+    )
     prompt = f"""
 Настали итоги недели! Проанализируй историю чата за неделю и составь короткий, красивый и смешной дайджест.
 
-История:
+{memory_block}Статистика сообщений за неделю (точные цифры из базы):
+{format_weekly_stats(counts)}
+
+История (выборка за неделю):
 {chat}
 
-Составь небольшой пост из 3 частей:
+Составь пост из 4 частей:
 1. 🏆 Главная тема недели
-2. 🎭 Атмосфера недели (в 1-2 предложениях)
-3. 📜 Напутствие Мяумяуры на следующую неделю (короткий мудрый совет)
+2. 🎭 Атмосфера недели (1-2 предложения)
+3. 🏅 Номинации недели — 3-4 смешные номинации участникам, по фактам из переписки и статистики: например «Болтун недели» (у кого больше всех сообщений, с цифрой), «Душнила недели», «Понтовщик недели», «Голос разума», «Пропал без вести» (у кого меньше всех сообщений). Каждая номинация — имя и одна подколка. Подкалывай по-доброму, без настоящих оскорблений.
+4. 📜 Напутствие Мяумяуры на следующую неделю (короткий мудрый совет)
 
-Пиши без имён пользователей, с лёгкой иронией, лаконично.
+Цифры бери только из статистики, ничего не выдумывай. Пиши с лёгкой иронией, лаконично.
 """
     try:
-        response = await call_gemini_safe(contents=prompt, config=_CFG_WISDOM_08)
+        response = await call_gemini_safe(contents=prompt, config=_CFG_WISDOM_08, timeout=30.0)
         return response.text.strip()
     except Exception as e:
         logging.error(f"Ошибка недели: {e}")

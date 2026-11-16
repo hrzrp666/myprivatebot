@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timedelta
 import aiosqlite
 
-from config import DATABASE_URL, DB_PATH, TZ
+from config import BOT_NAME, DATABASE_URL, DB_PATH, TZ
 
 # Два хранилища с одним интерфейсом:
 #  - Postgres (asyncpg), если задан DATABASE_URL — данные переживают деплои на Render;
@@ -262,6 +262,56 @@ async def clear_old_messages() -> None:
             )
             await _db_conn.commit()
     logging.info("Старая история очищена")
+
+
+async def get_user_message_counts(days: int = 7) -> list[tuple[str, int]]:
+    """Сколько сообщений написал каждый участник за days дней (без бота), по убыванию."""
+    if not _is_ready():
+        return []
+    limit_dt = datetime.now(TZ) - timedelta(days=days)
+    sql = """
+        SELECT username, COUNT(*) AS cnt
+        FROM messages
+        WHERE created >= {p1} AND username <> {p2}
+        GROUP BY username
+        ORDER BY cnt DESC, username ASC
+    """
+    if _pool is not None:
+        records = await _pool.fetch(sql.format(p1="$1", p2="$2"), limit_dt, BOT_NAME)
+        return [(r["username"], int(r["cnt"])) for r in records]
+    async with _db_conn.execute(
+        sql.format(p1="?", p2="?"), (limit_dt.isoformat(), BOT_NAME)
+    ) as cursor:
+        return [(u, int(c)) for u, c in await cursor.fetchall()]
+
+
+async def get_random_quote(
+    days: int = 30, min_len: int = 25, max_len: int = 300
+) -> tuple[str, str, datetime] | None:
+    """Случайная содержательная фраза участника (не бота, без служебных пометок и ссылок)."""
+    if not _is_ready():
+        return None
+    limit_dt = datetime.now(TZ) - timedelta(days=days)
+    sql = """
+        SELECT username, text, created
+        FROM messages
+        WHERE created >= {p1} AND username <> {p2}
+          AND length(text) BETWEEN {p3} AND {p4}
+          AND text NOT LIKE '[%' AND text NOT LIKE '%http%'
+        ORDER BY RANDOM()
+        LIMIT 1
+    """
+    if _pool is not None:
+        record = await _pool.fetchrow(
+            sql.format(p1="$1", p2="$2", p3="$3", p4="$4"), limit_dt, BOT_NAME, min_len, max_len
+        )
+        return (record["username"], record["text"], record["created"]) if record else None
+    async with _db_conn.execute(
+        sql.format(p1="?", p2="?", p3="?", p4="?"),
+        (limit_dt.isoformat(), BOT_NAME, min_len, max_len),
+    ) as cursor:
+        row = await cursor.fetchone()
+    return (row[0], row[1], datetime.fromisoformat(row[2])) if row else None
 
 
 async def get_kv(key: str) -> str:
