@@ -20,6 +20,7 @@ from pydantic import BaseModel
 
 from ai_service import (
     LIGHT_MODELS,
+    thinking,
     add_manual_fact,
     call_gemini_safe,
     fetch_url_metadata,
@@ -32,11 +33,11 @@ from stickers import available_sticker_emojis, pick_sticker
 from weather import fetch_dynamic_weather
 
 HISTORY_HOURS = 24
-HISTORY_LIMIT = 60
-HISTORY_MAX_CHARS = 12000
+HISTORY_LIMIT = 100  # больше контекста: Gemini 3 спокойно держит сотню реплик
+HISTORY_MAX_CHARS = 20000
 _MAX_TOOL_ROUNDS = 4
-_ANSWER_TIMEOUT = 25.0
-MEDIA_TIMEOUT = 40.0  # фото и кружки обрабатываются дольше
+_ANSWER_TIMEOUT = 35.0  # с размышлениями ответ готовится дольше
+MEDIA_TIMEOUT = 50.0  # фото и кружки обрабатываются дольше
 FALLBACK_TEXT = "Я рядом, но связь чуть сбоит. Выдохни и переспроси через пару секунд."
 
 # Модель иногда копирует формат истории и начинает ответ с «[16.11 18:05] Мудрец Мяумяура:»
@@ -339,8 +340,12 @@ async def ask_wisdom(
         contents[-1].parts.insert(0, media)
     timeout = MEDIA_TIMEOUT if media is not None else _ANSWER_TIMEOUT
     system = _system_instruction(user, memory_text)
+    # medium: бот реально думает над ответом, но не тормозит в чате
     config = genai_types.GenerateContentConfig(
-        temperature=0.7, system_instruction=system, tools=[_TOOLS]
+        temperature=0.7,
+        system_instruction=system,
+        tools=[_TOOLS],
+        thinking_config=thinking("medium"),
     )
     reply = BotReply()
 
@@ -366,6 +371,7 @@ async def ask_wisdom(
                 temperature=0.7,
                 system_instruction=system,
                 tools=[_TOOLS],
+                thinking_config=thinking("medium"),
                 tool_config=genai_types.ToolConfig(
                     function_calling_config=genai_types.FunctionCallingConfig(mode="NONE")
                 ),
