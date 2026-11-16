@@ -33,6 +33,15 @@ async def init_db() -> None:
             )
             await conn.execute("CREATE TABLE IF NOT EXISTS posts(date TEXT PRIMARY KEY)")
             await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS kv(
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated TIMESTAMPTZ NOT NULL
+                )
+                """
+            )
+            await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created)"
             )
         logging.info("Postgres готов (история сохраняется между деплоями)")
@@ -61,6 +70,15 @@ async def init_db() -> None:
         """
         CREATE TABLE IF NOT EXISTS posts(
             date TEXT PRIMARY KEY
+        )
+        """
+    )
+    await _db_conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS kv(
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated TEXT NOT NULL
         )
         """
     )
@@ -239,6 +257,45 @@ async def clear_old_messages() -> None:
             )
             await _db_conn.commit()
     logging.info("Старая история очищена")
+
+
+async def get_kv(key: str) -> str:
+    """Читает значение из хранилища «ключ — текст» (долгая память бота). Нет значения — пустая строка."""
+    if not _is_ready():
+        return ""
+    if _pool is not None:
+        value = await _pool.fetchval("SELECT value FROM kv WHERE key = $1", key)
+        return value or ""
+    async with _db_conn.execute("SELECT value FROM kv WHERE key = ?", (key,)) as cursor:
+        row = await cursor.fetchone()
+    return row[0] if row else ""
+
+
+async def set_kv(key: str, value: str) -> None:
+    """Записывает значение по ключу (перезаписывает старое)."""
+    if not _is_ready():
+        return
+    now = datetime.now(TZ)
+    if _pool is not None:
+        await _pool.execute(
+            """
+            INSERT INTO kv(key, value, updated) VALUES ($1, $2, $3)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated = EXCLUDED.updated
+            """,
+            key,
+            value,
+            now,
+        )
+        return
+    async with _write_lock:
+        await _db_conn.execute(
+            """
+            INSERT INTO kv(key, value, updated) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated = excluded.updated
+            """,
+            (key, value, now.isoformat()),
+        )
+        await _db_conn.commit()
 
 
 async def was_post_today() -> bool:

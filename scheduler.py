@@ -4,7 +4,7 @@ import logging
 from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from ai_service import generate_text, generate_weekly_digest
+from ai_service import generate_text, generate_weekly_digest, update_long_memory
 from config import CHAT_ID, IRKUTSK_LAT, IRKUTSK_LON, KULTUK_LAT, KULTUK_LON, TZ
 from database import clear_old_messages, save_post_today, was_post_today
 from weather import get_weather_day
@@ -104,6 +104,18 @@ def setup_scheduler(bot: Bot) -> None:
         hour=4,
         minute=0,
         id="database_cleanup",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
+
+    # Каждый день 05:30 Иркутск — обновление долгой памяти бота по вчерашней переписке
+    scheduler.add_job(
+        update_long_memory,
+        "cron",
+        hour=5,
+        minute=30,
+        id="memory_update",
         replace_existing=True,
         misfire_grace_time=3600,
         coalesce=True,

@@ -11,14 +11,18 @@ from aiogram.filters import Command
 from aiogram.types import BufferedInputFile
 
 from ai_service import (
+    add_manual_fact,
     analyze_visual_media,
     ask_wisdom,
     check_ilya_ponto_radar,
+    clear_memory,
     fact_check_dispute,
     generate_summary,
+    get_memory_context,
     maybe_join_conversation,
     summarize_media_url,
     transcribe_voice_bytes,
+    update_long_memory,
 )
 from config import (
     ADMIN_ID,
@@ -106,8 +110,67 @@ async def start_cmd(message: types.Message) -> None:
         "• Каждое утро в 09:00 — Мысль дня и погода\n"
         "• /summary — Краткая выжимка (что пропустили в чате)\n"
         "• /пробей &lt;вопрос&gt; — Разрулить любой спор по фактам с пруфами\n"
+        "• /memory — Что я помню о вас, /remember &lt;факт&gt; — запомнить вручную\n"
         "• Каждое воскресенье в 20:00 — Итоги недели\n"
         "• Кидай голосовые (я расшифрую) и фотки/кружочки (я заценю)!"
+    )
+
+
+def _is_admin(message: types.Message) -> bool:
+    return bool(ADMIN_ID and message.from_user and str(message.from_user.id) == str(ADMIN_ID))
+
+
+@router.message(Command("memory", "память"))
+async def memory_cmd(message: types.Message) -> None:
+    """Показывает, что бот помнит о компании (долгая память)."""
+    if message.chat.id != CHAT_ID:
+        return
+    memory = await get_memory_context()
+    if not memory:
+        await message.reply(
+            "🧠 Долгая память пока пустая. Я обновляю её раз в сутки по вашей переписке, "
+            "а факт можно добавить сразу: <code>/remember Захар купил машину</code>"
+        )
+        return
+    await message.reply(f"🧠 <b>Что я помню о вас:</b>\n\n{html.escape(memory[:3300])}")
+
+
+@router.message(Command("remember", "запомни"))
+async def remember_cmd(message: types.Message) -> None:
+    """Добавляет факт в долгую память вручную (можно ответом на сообщение)."""
+    if message.chat.id != CHAT_ID:
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    fact = parts[1].strip() if len(parts) > 1 else ""
+    if not fact and message.reply_to_message:
+        fact = (message.reply_to_message.text or message.reply_to_message.caption or "").strip()
+    if not fact:
+        await message.reply("Напиши, что запомнить: <code>/remember Илья вернулся с вахты</code>")
+        return
+    await add_manual_fact(fact)
+    await message.reply("🧠 Запомнил.")
+
+
+@router.message(Command("forget", "забудь"))
+async def forget_cmd(message: types.Message) -> None:
+    """Полностью стирает долгую память (только администратор)."""
+    if not _is_admin(message):
+        return
+    await clear_memory()
+    await message.reply("🧠 Долгая память очищена.")
+
+
+@router.message(Command("memupdate"))
+async def memupdate_cmd(message: types.Message) -> None:
+    """Принудительно обновляет долгую память по переписке за сутки (только администратор)."""
+    if not _is_admin(message):
+        return
+    status_msg = await message.reply("🧠 Обновляю заметки...")
+    updated = await update_long_memory()
+    await status_msg.edit_text(
+        "🧠 Заметки обновлены. Посмотреть: /memory"
+        if updated
+        else "🧠 Не обновил: за сутки мало переписки или Gemini не ответил. Старые заметки сохранены."
     )
 
 
