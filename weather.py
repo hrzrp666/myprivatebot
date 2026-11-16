@@ -10,10 +10,10 @@ import aiohttp
 from aiogram import types
 
 from config import (
+    IRKUTSK_LAT,
+    IRKUTSK_LON,
     KULTUK_LAT,
     KULTUK_LON,
-    SVYATOY_NOS_LAT,
-    SVYATOY_NOS_LON,
     TZ,
     TZ_MSK,
     WEATHER_CODES,
@@ -25,14 +25,22 @@ _http_session: aiohttp.ClientSession | None = None
 _WEATHER_CACHE: dict[str, tuple[Any, float]] = {}
 _MAX_CACHE_SIZE = 100
 
-_CITY_RE = re.compile(r"(?:в|во|на|по|городе|город)\s+([а-яА-Яa-zA-Z0-9\-]+)")
+# Предлог должен стоять отдельным словом: раньше «в» находилось и в конце других слов.
+_CITY_RE = re.compile(r"(?<![а-яa-z0-9])(?:в|во|на|по|городе|город)\s+([а-яa-z0-9\-]+)")
 _STOP_WORDS = frozenset({
     "погоду", "погоде", "погодка", "погодку", "погодам", "делам", "пацански",
     "факту", "душе", "жизни", "утром", "вечером", "ночью", "день", "дням", "завтра",
     "сегодня", "понедельник", "вторник", "среду", "четверг", "пятницу", "субботу", "воскресенье",
+    "чате", "чат", "работе", "работу", "улице", "доме", "дворе", "машине", "жизнь", "целом",
+    "общем", "принципе", "итоге", "связи", "сети", "интернете", "теории", "голове",
 })
-_SVYATOY_NOS_KEYS = ("свято", "нос", "баренцев", "мурманск", "север")
-_ARMY_KEYS = ("вахт", "дежур", "армей", "служб", "сводк", "рапорт")
+# Явные города: основа слова ищется по границе слова, а не внутри чужих слов
+_KULTUK_RE = re.compile(r"(?<![а-я])култук")
+_IRKUTSK_RE = re.compile(r"(?<![а-я])иркутск")
+_MOSCOW_RE = re.compile(r"(?<![а-я])москв")
+_SPB_RE = re.compile(r"(?<![а-я])(?:питер|петербург)")
+# Слова, прямо говорящие о погоде: только тогда пробуем вытащить город из фразы
+_WEATHER_WORD_RE = re.compile(r"погод|температур|градус|прогноз")
 
 
 def get_cached_weather(key: str, max_age_seconds: int = 600) -> Any | None:
@@ -152,41 +160,33 @@ def _resolve_location(
     query_text: str, user: types.User | None
 ) -> tuple[str, str, tuple[float, float, ZoneInfo] | None]:
     """Определяет целевую локацию (ключ запроса, название, координаты + часовой пояс для фоллбэка)."""
+    # user оставлен в сигнатуре для совместимости; персональных локаций больше нет
     q_lower = query_text.lower()
-    username = (user.username or "").lower() if user else ""
-    first_name = (user.first_name or "").lower() if user else ""
 
-    if any(k in q_lower for k in _SVYATOY_NOS_KEYS):
-        return (
-            f"{SVYATOY_NOS_LAT},{SVYATOY_NOS_LON}",
-            "Мыс Святой Нос (Баренцево море, Мурманская область)",
-            (SVYATOY_NOS_LAT, SVYATOY_NOS_LON, TZ_MSK),
-        )
-    if "култук" in q_lower:
+    if _KULTUK_RE.search(q_lower):
         return (
             f"{KULTUK_LAT},{KULTUK_LON}",
             "Култук (Иркутская область, Байкал)",
             (KULTUK_LAT, KULTUK_LON, TZ),
         )
-    if "иркутск" in q_lower:
-        return "Иркутск", "Иркутск", (52.2869, 104.3050, TZ)
-    if "москв" in q_lower:
+    if _IRKUTSK_RE.search(q_lower):
+        return (
+            f"{IRKUTSK_LAT},{IRKUTSK_LON}",
+            "Иркутск",
+            (IRKUTSK_LAT, IRKUTSK_LON, TZ),
+        )
+    if _MOSCOW_RE.search(q_lower):
         return "Москва", "Москва", (55.7558, 37.6173, TZ_MSK)
-    if "питер" in q_lower or "петербург" in q_lower:
+    if _SPB_RE.search(q_lower):
         return "Санкт-Петербург", "Санкт-Петербург", (59.9343, 30.3351, TZ_MSK)
 
-    if username == "tombarket" or first_name in ("павел", "паша") or any(k in q_lower for k in _ARMY_KEYS):
-        return (
-            f"{SVYATOY_NOS_LAT},{SVYATOY_NOS_LON}",
-            "Мыс Святой Нос (Баренцево море, Мурманская область)",
-            (SVYATOY_NOS_LAT, SVYATOY_NOS_LON, TZ_MSK),
-        )
-
-    match = _CITY_RE.search(q_lower)
-    if match:
-        extracted = match.group(1).strip()
-        if extracted not in _STOP_WORDS and len(extracted) > 2:
-            return extracted, extracted.capitalize(), None
+    # Произвольный город берём только если человек прямо спрашивает про погоду
+    if _WEATHER_WORD_RE.search(q_lower):
+        match = _CITY_RE.search(q_lower)
+        if match:
+            extracted = match.group(1).strip()
+            if extracted not in _STOP_WORDS and len(extracted) > 2:
+                return extracted, extracted.capitalize(), None
 
     return (
         f"{KULTUK_LAT},{KULTUK_LON}",

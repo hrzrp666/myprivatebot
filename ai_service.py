@@ -39,6 +39,8 @@ _MODELS_PRIORITY = [
     "gemini-2.5-flash-lite",
     "gemini-3-flash-preview",
 ]
+# Таймаут для тяжёлых запросов с файлами (голосовые, фото, видео-кружки)
+_MEDIA_TIMEOUT = 35.0
 # Мемоизация 404-моделей и временный кулдаун для перегруженных моделей
 _DEAD_MODELS: set[str] = set()
 _COOLDOWN_UNTIL: dict[str, float] = {}
@@ -133,7 +135,9 @@ async def call_gemini_safe(
 
         except asyncio.TimeoutError:
             logging.warning(f"Gemini таймаут ({model} > {timeout}с). Переключаемся на следующую модель...")
-            _COOLDOWN_UNTIL[model] = time.monotonic() + 180
+            # Таймаут чаще из-за тяжёлого запроса (видео/аудио), а не из-за модели: кулдаун короткий,
+            # чтобы один медленный запрос не выключал все модели на минуты
+            _COOLDOWN_UNTIL[model] = time.monotonic() + 45
         except Exception as e:
             err_str = str(e)
             if "404" in err_str or "NOT_FOUND" in err_str:
@@ -322,7 +326,9 @@ async def analyze_visual_media(
     )
     try:
         part = genai_types.Part.from_bytes(data=media_bytes, mime_type=mime_type)
-        response = await call_gemini_safe(contents=[part, prompt], config=_CFG_WISDOM_07)
+        response = await call_gemini_safe(
+            contents=[part, prompt], config=_CFG_WISDOM_07, timeout=_MEDIA_TIMEOUT
+        )
         return response.text.strip()
     except Exception as e:
         logging.error(f"Ошибка Vision: {e}")
@@ -337,7 +343,9 @@ async def transcribe_voice_bytes(voice_bytes: bytes) -> str:
     )
     try:
         part = genai_types.Part.from_bytes(data=voice_bytes, mime_type="audio/ogg")
-        response = await call_gemini_safe(contents=[part, prompt], config=_CFG_AUDIO_02)
+        response = await call_gemini_safe(
+            contents=[part, prompt], config=_CFG_AUDIO_02, timeout=_MEDIA_TIMEOUT
+        )
         return response.text.strip()
     except Exception as e:
         logging.error(f"Ошибка транскрибации войса: {e}")
@@ -472,7 +480,7 @@ async def maybe_join_conversation(last_user: types.User | None = None) -> str:
 {chat}
 
 Ты собираешься отреагировать на реплику пользователя {user_name} ({username_tag}).
-1. Вникни в суть разговора и ответь уверенно, по-пацански и без подхалимажа, помня роли каждого в банде (Захар — главный кент, Паша — служит на Севере на Святом Носе в Баренцевом море, Илья — нефтяник для подколов).
+1. Вникни в суть разговора и ответь уверенно, по-пацански и без подхалимажа, помня роли каждого в банде (Захар — главный кент, Паша — свой кент, недавно дембельнулся и уже дома, Илья — нефтяник для подколов).
 2. Если уместно органично подключиться — напиши 1–2 живых предложения.
 3. Если разговор сугубо личный, тема не располагает к вмешательству или сказать нечего — напиши строго одно слово: SKIP
 """
