@@ -50,6 +50,22 @@ async def get_bot_info(bot: Bot) -> types.User:
     return _bot_info
 
 
+def _format_reply_quote(reply: types.Message | None, bot_info: types.User) -> str | None:
+    """Текст сообщения, на которое отвечают, с указанием автора (иначе модель путает, кто что сказал)."""
+    if not reply:
+        return None
+    text = reply.text or reply.caption
+    if not text:
+        return None
+    if reply.from_user and reply.from_user.id == bot_info.id:
+        author = "Мудрец Мяумяура"
+    elif reply.from_user and reply.from_user.first_name:
+        author = reply.from_user.first_name
+    else:
+        author = "Участник"
+    return f"[{author}]: {text[:500]}"
+
+
 _BOT_NAME_TRIGGERS = ("мяумяур", "мудрец")
 _BOT_WORD_RE = re.compile(r"\bбот\b", re.IGNORECASE)
 
@@ -268,11 +284,7 @@ async def collect(message: types.Message, bot: Bot) -> None:
         bot_info = await get_bot_info(bot)
         if _is_addressed_to_bot(message, bot_info, text_lower):
             await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-            reply_quote = (
-                (message.reply_to_message.text or message.reply_to_message.caption)
-                if message.reply_to_message
-                else None
-            )
+            reply_quote = _format_reply_quote(message.reply_to_message, bot_info)
             answer = await ask_wisdom(message.text, message.from_user, reply_quote)
             await save_message("Мудрец Мяумяура", answer)
 
