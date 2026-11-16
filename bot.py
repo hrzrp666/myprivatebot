@@ -46,7 +46,9 @@ async def main() -> None:
     logging.info("🧙 Мудрец Мяумяура работает")
 
     try:
-        await dp.start_polling(bot, skip_updates=True)
+        # В aiogram 3 параметра skip_updates нет: накопившиеся апдейты сбрасываются так
+        await bot.delete_webhook(drop_pending_updates=True)
+        await dp.start_polling(bot)
     finally:
         logging.info("Остановка бота...")
         shutdown_scheduler()

@@ -1,0 +1,23 @@
+# Секреты и локальная конфигурация
+.env
+.env.*
+!.env.example
+
+# База данных и логи
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Редакторы и ОС
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

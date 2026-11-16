@@ -97,7 +97,8 @@ async def start_cmd(message: types.Message) -> None:
 
 @router.message(Command("test"))
 async def test_cmd(message: types.Message, bot: Bot) -> None:
-    if ADMIN_ID and message.from_user and str(message.from_user.id) != str(ADMIN_ID):
+    # Без заданного ADMIN_ID команда закрыта для всех (раньше была открыта любому)
+    if not ADMIN_ID or not message.from_user or str(message.from_user.id) != str(ADMIN_ID):
         await message.reply("🧙 Только хранитель знаний (администратор) может вызывать это испытание.")
         return
 
@@ -109,6 +110,9 @@ async def test_cmd(message: types.Message, bot: Bot) -> None:
 @router.message(Command("summary"))
 async def summary_cmd(message: types.Message, bot: Bot) -> None:
     """Краткая выжимка того, что произошло в чате за 12 часов."""
+    # История принадлежит только основному чату: в личке и в чужих чатах не отвечаем
+    if message.chat.id != CHAT_ID:
+        return
     await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
     status_msg = await message.reply("🔮 Вспоминаю, о чём вы шептались...")
 
@@ -120,6 +124,9 @@ async def summary_cmd(message: types.Message, bot: Bot) -> None:
 @router.message(Command("probe", "пробей", "факт", "пруф", "спор", "чек"))
 async def probe_cmd(message: types.Message, bot: Bot) -> None:
     """Фактчекер споров по фактам с выходом в поиск."""
+    # Только основной чат: иначе посторонние тратят лимит Gemini
+    if message.chat.id != CHAT_ID:
+        return
     parts = (message.text or "").split(maxsplit=1)
     query = parts[1].strip() if len(parts) > 1 else ""
     if not query and message.reply_to_message:
