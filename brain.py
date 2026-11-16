@@ -27,6 +27,7 @@ from ai_service import (
 )
 from config import BOT_NAME, REACTION_EMOJIS, TZ, WISDOM_SYSTEM_INSTRUCTION, get_user_context
 from database import get_recent_rows
+from mood import mood_instruction
 from stickers import available_sticker_emojis, pick_sticker
 from weather import fetch_dynamic_weather
 
@@ -35,6 +36,7 @@ HISTORY_LIMIT = 60
 HISTORY_MAX_CHARS = 12000
 _MAX_TOOL_ROUNDS = 4
 _ANSWER_TIMEOUT = 25.0
+MEDIA_TIMEOUT = 40.0  # фото и кружки обрабатываются дольше
 FALLBACK_TEXT = "Я рядом, но связь чуть сбоит. Выдохни и переспроси через пару секунд."
 
 # Модель иногда копирует формат истории и начинает ответ с «[16.11 18:05] Мудрец Мяумяура:»
@@ -272,7 +274,12 @@ _TOOLS_GUIDE = (
 
 
 def _system_instruction(user: types.User | None, memory_text: str) -> str:
-    parts = [WISDOM_SYSTEM_INSTRUCTION, _TOOLS_GUIDE, f"\n\nСОБЕСЕДНИК СЕЙЧАС: {get_user_context(user)}"]
+    parts = [
+        WISDOM_SYSTEM_INSTRUCTION,
+        mood_instruction(),
+        _TOOLS_GUIDE,
+        f"\n\nСОБЕСЕДНИК СЕЙЧАС: {get_user_context(user)}",
+    ]
     if memory_text:
         parts.append(
             "\n\nДОЛГАЯ ПАМЯТЬ О КОМПАНИИ (накопленные заметки; это фон, не пересказывай без нужды):\n"
@@ -294,8 +301,14 @@ async def ask_wisdom(
     user: types.User | None = None,
     reply_quote: str | None = None,
     spontaneous: bool = False,
+    media: genai_types.Part | None = None,
+    media_kind: str = "фото",
 ) -> BotReply:
-    """Главный ответ бота: диалог с историей + инструменты. Никогда не бросает исключений."""
+    """Главный ответ бота: диалог с историей + инструменты. Никогда не бросает исключений.
+
+    media — фото или кружок: модель видит его вместе с историей и долгой памятью,
+    поэтому комментирует в контексте разговора, а не в отрыве от него.
+    """
     user_name = user.first_name if user and user.first_name else "Участник"
     username_tag = f"@{user.username}" if user and user.username else user_name
 
@@ -304,7 +317,13 @@ async def ask_wisdom(
         get_memory_context(),
     )
 
-    if spontaneous:
+    if media is not None:
+        caption = f" с подписью «{user_question}»" if user_question else ""
+        note = (
+            f"[{user_name} ({username_tag}) прислал {media_kind}{caption}. Посмотри внимательно и "
+            "отреагируй в своём стиле с учётом разговора: 1–2 фразы, юмор, подкол или респект.]"
+        )
+    elif spontaneous:
         note = (
             f"[Тебя не звали: ты сам решил вклиниться после сообщения {user_name} «{user_question}». "
             "Скажи 1–2 живые фразы по теме разговора, без приветствий и без «кстати».]"
@@ -316,6 +335,9 @@ async def ask_wisdom(
         note += "]"
 
     contents = build_dialogue(rows, note)
+    if media is not None:
+        contents[-1].parts.insert(0, media)
+    timeout = MEDIA_TIMEOUT if media is not None else _ANSWER_TIMEOUT
     system = _system_instruction(user, memory_text)
     config = genai_types.GenerateContentConfig(
         temperature=0.7, system_instruction=system, tools=[_TOOLS]
@@ -325,7 +347,7 @@ async def ask_wisdom(
     try:
         response = None
         for _ in range(_MAX_TOOL_ROUNDS):
-            response = await call_gemini_safe(contents=contents, config=config, timeout=_ANSWER_TIMEOUT)
+            response = await call_gemini_safe(contents=contents, config=config, timeout=timeout)
             calls = response.function_calls or []
             if not calls:
                 break
@@ -348,7 +370,7 @@ async def ask_wisdom(
                     function_calling_config=genai_types.FunctionCallingConfig(mode="NONE")
                 ),
             )
-            response = await call_gemini_safe(contents=contents, config=no_tools, timeout=_ANSWER_TIMEOUT)
+            response = await call_gemini_safe(contents=contents, config=no_tools, timeout=timeout)
 
         reply.text = _extract_text(response)
     except Exception as e:

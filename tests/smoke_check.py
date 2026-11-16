@@ -4,21 +4,25 @@
 и при желании DATABASE_URL (Postgres), затем: python tests/smoke_check.py
 """
 import asyncio
+import random
 import re
 import sys
 from pathlib import Path
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import ai_service  # noqa: E402
 import brain  # noqa: E402
+import cooldowns  # noqa: E402
 import config  # noqa: E402
 import database  # noqa: E402
 import handlers  # noqa: E402
+import mood  # noqa: E402
 import stickers  # noqa: E402
 import weather  # noqa: E402
+import whosaid  # noqa: E402
 from google.genai import types as genai_types  # noqa: E402
 
 
@@ -228,6 +232,161 @@ async def check_brain_with_db() -> None:
     print("brain with db OK")
 
 
+class _ApiError(Exception):
+    def __init__(self, code: int) -> None:
+        super().__init__(f"api error {code}")
+        self.code = code
+
+
+def check_fun_pure() -> None:
+    """Настроение дня, варианты для «Кто это сказал?», разбор ошибок Gemini, статистика."""
+    day = date(2026, 11, 16)
+    assert mood.mood_for(day) == mood.mood_for(day) and mood.mood_for(day) in mood.MOODS
+    assert len({mood.mood_for(date(2026, 1, 1) + timedelta(days=i)) for i in range(30)}) > 1
+    assert mood.today_mood()[0] in mood.mood_instruction()
+
+    names = ["Захар", "Паша", "Илья", "Тест", "Вася", "Захар"]
+    options = whosaid.build_options("Захар", names, random.Random(1))
+    assert len(options) == 4 and "Захар" in options and len(set(options)) == 4
+    assert sorted(whosaid.build_options("A", ["A", "B"])) == ["A", "B"]
+    game_id = whosaid.new_game("A", ["A", "B"], datetime(2026, 11, 1, tzinfo=config.TZ))
+    assert whosaid.get_game(game_id).answer == "A" and whosaid.get_game("nope") is None
+
+    classify = ai_service.classify_gemini_error
+    assert classify(_ApiError(404)) == "dead"
+    assert classify(_ApiError(429)) == "overloaded" and classify(_ApiError(503)) == "overloaded"
+    assert classify(_ApiError(400)) == "other"
+    assert classify(Exception("429 RESOURCE_EXHAUSTED")) == "overloaded"
+    assert classify(Exception("boom")) == "other"
+
+    stats = ai_service.format_weekly_stats([("Захар", 10), ("Илья", 2)])
+    assert stats == "Захар — 10 сообщ.\nИлья — 2 сообщ.", stats
+    print("fun pure OK")
+
+
+async def check_fun_with_db() -> None:
+    # --- паузы переживают перезапуск ---
+    cooldowns.reset_cache()
+    assert await cooldowns.since("never") is None
+    assert await cooldowns.try_acquire("x", timedelta(hours=1)) is True
+    assert await cooldowns.try_acquire("x", timedelta(hours=1)) is False
+    cooldowns.reset_cache()  # как после деплоя: читаем из базы
+    assert await cooldowns.try_acquire("x", timedelta(hours=1)) is False
+    assert await cooldowns.since("x") < timedelta(minutes=1)
+    assert await cooldowns.try_acquire("x", timedelta(0)) is True
+
+    # --- статистика и случайная цитата ---
+    await database.save_message("Захар", "это очень длинная и содержательная фраза для игры")
+    await database.save_message(config.BOT_NAME, "бот тоже говорит длинные фразы, но его быть не должно")
+    await database.save_message("Паша", "[Фото]: подпись к фото, служебная пометка, не для игры")
+    await database.save_message("Паша", "зацените https://example.com/very/long/link/for/the/game")
+    counts = await database.get_user_message_counts(days=7)
+    assert config.BOT_NAME not in [n for n, _ in counts], counts
+    assert ("Тест", 2) in counts and ("Захар", 1) in counts and ("Паша", 2) in counts, counts
+    assert [c for _, c in counts] == sorted((c for _, c in counts), reverse=True), counts
+    for _ in range(5):
+        author, text, said_at = await database.get_random_quote(days=30)
+        assert author == "Захар" and "содержательная" in text and said_at.tzinfo is not None
+
+    assert await whosaid.add_point("Илья") == 1
+    assert await whosaid.add_point("Илья") == 2
+    await whosaid.add_point("Паша")
+    assert await whosaid.leaderboard() == [("Илья", 2), ("Паша", 1)]
+
+    async def fake_radar(*args, **kwargs):
+        return SimpleNamespace(text="Опять баррели считаешь?")
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("Gemini лежит")
+
+    prompts = []
+
+    async def fake_daily(contents=None, config=None, **kwargs):
+        prompts.append(contents)
+        return SimpleNamespace(text='{"holiday": "День народного единства", "quote": "Мысль"}')
+
+    async def fake_digest(contents=None, config=None, **kwargs):
+        prompts.append(contents)
+        return SimpleNamespace(text="Дайджест")
+
+    original = ai_service.call_gemini_safe
+    try:
+        # --- радар понтов: только @Akishinov и с паузой ---
+        ai_service.call_gemini_safe = fake_radar
+        ilya = SimpleNamespace(
+            from_user=SimpleNamespace(username="Akishinov", first_name="Илья"),
+            text="купил новую тачку за миллион",
+            caption=None,
+        )
+        other_ilya = SimpleNamespace(
+            from_user=SimpleNamespace(username="other", first_name="Илья"),
+            text="купил новую тачку",
+            caption=None,
+        )
+        assert await ai_service.check_ilya_ponto_radar(other_ilya) == ""
+        alert = await ai_service.check_ilya_ponto_radar(ilya)
+        assert "РАДАР ПОНТОВ" in alert and "баррели" in alert
+        assert await ai_service.check_ilya_ponto_radar(ilya) == "", "второй раз подряд — пауза"
+
+        # --- утренний пост: без выдуманного праздника, с настроением ---
+        ai_service.call_gemini_safe = broken
+        assert (await ai_service.generate_text())["holiday"] == ""
+        ai_service.call_gemini_safe = fake_daily
+        data = await ai_service.generate_text()
+        assert data == {"holiday": "День народного единства", "quote": "Мысль"}
+        assert mood.today_mood()[0] in prompts[-1]
+
+        # --- итоги недели: статистика и номинации ---
+        ai_service.call_gemini_safe = fake_digest
+        assert await ai_service.generate_weekly_digest() == "Дайджест"
+        assert "Тест — 2 сообщ." in prompts[-1] and "Номинации недели" in prompts[-1]
+    finally:
+        ai_service.call_gemini_safe = original
+
+    # --- 404 по коду ошибки выкидывает модель, запрос уходит в следующую ---
+    called = []
+
+    async def fake_generate(model=None, contents=None, config=None):
+        called.append(model)
+        if model == "dead-model":
+            raise _ApiError(404)
+        return SimpleNamespace(text="ok")
+
+    original_client = ai_service.gemini
+    try:
+        ai_service.gemini = SimpleNamespace(
+            aio=SimpleNamespace(models=SimpleNamespace(generate_content=fake_generate))
+        )
+        response = await ai_service.call_gemini_safe("hi", models=["dead-model", "good-model"])
+        assert response.text == "ok" and called == ["dead-model", "good-model"]
+        assert "dead-model" in ai_service._DEAD_MODELS
+    finally:
+        ai_service.gemini = original_client
+        ai_service._DEAD_MODELS.discard("dead-model")
+
+    # --- фото идёт в мозг вместе с историей и настроением ---
+    seen = {}
+
+    async def fake_vision(contents=None, config=None, **kwargs):
+        seen["contents"], seen["config"], seen["timeout"] = contents, config, kwargs.get("timeout")
+        return SimpleNamespace(function_calls=None, candidates=[], text="Огонь фотка")
+
+    original = brain.call_gemini_safe
+    try:
+        brain.call_gemini_safe = fake_vision
+        photo = genai_types.Part.from_bytes(data=b"img", mime_type="image/jpeg")
+        user = SimpleNamespace(first_name="Паша", username="tombarket", id=7)
+        reply = await brain.ask_wisdom("зацени", user, media=photo, media_kind="фото")
+        assert reply.text == "Огонь фотка"
+        last = seen["contents"][-1]
+        assert last.parts[0] is photo and "прислал фото" in last.parts[-1].text
+        assert "НАСТРОЕНИЕ ДНЯ" in seen["config"].system_instruction
+        assert seen["timeout"] == brain.MEDIA_TIMEOUT
+    finally:
+        brain.call_gemini_safe = original
+    print("fun with db OK")
+
+
 async def check_database() -> None:
     backend = "postgres" if config.DATABASE_URL else "sqlite"
     await database.init_db()
@@ -256,6 +415,7 @@ async def check_database() -> None:
 
         await check_long_memory()
         await check_brain_with_db()
+        await check_fun_with_db()
     finally:
         await database.close_db()
     print(f"database OK ({backend})")
@@ -265,4 +425,5 @@ if __name__ == "__main__":
     check_weather_logic()
     check_reply_quote()
     check_brain_pure()
+    check_fun_pure()
     asyncio.run(check_database())

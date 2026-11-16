@@ -1,4 +1,5 @@
 """Коллекция стикеров: бот запоминает стикеры, которые кидают в чат, и потом отвечает ими сам."""
+import asyncio
 import json
 import random
 
@@ -6,6 +7,8 @@ from database import get_kv, set_kv
 
 STICKERS_KEY = "stickers"
 _MAX_STICKERS = 300
+# Два стикера подряд не должны затереть друг друга при одновременной записи
+_lock = asyncio.Lock()
 
 
 async def _load() -> list[dict]:
@@ -21,11 +24,12 @@ async def _load() -> list[dict]:
 
 async def remember_sticker(file_id: str, unique_id: str, emoji: str | None) -> None:
     """Сохраняет стикер (без дублей); старые вытесняются, когда коллекция переполнена."""
-    stickers = await _load()
-    if any(s.get("uid") == unique_id for s in stickers):
-        return
-    stickers.append({"id": file_id, "uid": unique_id, "emoji": emoji or ""})
-    await set_kv(STICKERS_KEY, json.dumps(stickers[-_MAX_STICKERS:], ensure_ascii=False))
+    async with _lock:
+        stickers = await _load()
+        if any(s.get("uid") == unique_id for s in stickers):
+            return
+        stickers.append({"id": file_id, "uid": unique_id, "emoji": emoji or ""})
+        await set_kv(STICKERS_KEY, json.dumps(stickers[-_MAX_STICKERS:], ensure_ascii=False))
 
 
 async def pick_sticker(emoji: str | None = None) -> str | None:
