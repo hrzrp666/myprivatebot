@@ -417,6 +417,75 @@ def check_brain_power() -> None:
     print("brain power OK")
 
 
+async def check_daily_weather() -> None:
+    """Утренняя погода: Open-Meteo, при отказе — wttr.in, при отказе обоих — «нет данных»."""
+    today = "2026-11-21"
+    meteo = {
+        "hourly": {
+            "time": [f"{today}T{h:02d}:00" for h in range(24)],
+            "temperature_2m": [-10.4] * 24,
+            "wind_speed_10m": [3.2] * 24,
+            "weather_code": [73] * 24,
+        }
+    }
+    day = weather.parse_open_meteo_day(meteo, today)
+    assert day["🌅 Утро"] == "-10°C, снег, ветер 3 м/с", day
+    assert weather.parse_open_meteo_day(meteo, "2026-11-25") is None, "чужая дата — нет данных"
+    assert weather.parse_open_meteo_day({}, today) is None
+
+    wttr = {
+        "weather": [{
+            "hourly": [
+                {"time": str(h * 100), "tempC": str(-h), "windspeedKmph": "18",
+                 "lang_ru": [{"value": "Умеренный снег"}]}
+                for h in range(0, 24, 3)
+            ]
+        }]
+    }
+    day = weather.parse_wttr_day(wttr)
+    assert day == {
+        "🌅 Утро": "-9°C, умеренный снег, ветер 5 м/с",
+        "☀️ День": "-15°C, умеренный снег, ветер 5 м/с",
+        "🌆 Вечер": "-21°C, умеренный снег, ветер 5 м/с",
+    }, day
+    assert weather.parse_wttr_day({}) is None
+    assert weather.parse_wttr_day({"weather": [{"hourly": []}]}) is None
+
+    original = weather._fetch_open_meteo, weather._fetch_wttr
+    calls = []
+
+    async def meteo_429(lat, lon):
+        calls.append("meteo")
+        return None
+
+    async def wttr_ok(lat, lon):
+        calls.append("wttr")
+        return wttr
+
+    async def wttr_broken(lat, lon):
+        calls.append("wttr")
+        raise RuntimeError("timeout")
+
+    try:
+        weather._WEATHER_CACHE.clear()
+        weather._fetch_open_meteo, weather._fetch_wttr = meteo_429, wttr_ok
+        day = await weather.get_weather_day(1.0, 2.0)
+        assert calls == ["meteo", "wttr"] and "умеренный снег" in day["🌅 Утро"], (calls, day)
+        # второй запрос — из кэша, без обращений к сервисам
+        await weather.get_weather_day(1.0, 2.0)
+        assert calls == ["meteo", "wttr"]
+
+        weather._WEATHER_CACHE.clear()
+        calls.clear()
+        weather._fetch_wttr = wttr_broken
+        day = await weather.get_weather_day(3.0, 4.0)
+        assert calls == ["meteo", "wttr"] and set(day.values()) == {"нет данных"}, (calls, day)
+    finally:
+        weather._fetch_open_meteo, weather._fetch_wttr = original
+        weather._WEATHER_CACHE.clear()
+    print("daily weather OK")
+
+
 async def check_database() -> None:
     backend = "postgres" if config.DATABASE_URL else "sqlite"
     await database.init_db()
@@ -457,4 +526,5 @@ if __name__ == "__main__":
     check_brain_pure()
     check_fun_pure()
     check_brain_power()
+    asyncio.run(check_daily_weather())
     asyncio.run(check_database())

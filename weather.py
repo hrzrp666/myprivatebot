@@ -80,7 +80,108 @@ async def close_http_session() -> None:
         _http_session = None
 
 
+_DAY_SLOTS = {"🌅 Утро": 9, "☀️ День": 15, "🌆 Вечер": 21}
+NO_DATA = "нет данных"
+
+
+def _empty_day() -> dict[str, str]:
+    return {title: NO_DATA for title in _DAY_SLOTS}
+
+
+def _has_data(day: dict[str, str] | None) -> bool:
+    return bool(day) and any(v != NO_DATA for v in day.values())
+
+
+def parse_open_meteo_day(data: dict, today_str: str) -> dict[str, str] | None:
+    """Утро/день/вечер из ответа Open-Meteo. None — если нужных часов в ответе нет."""
+    hourly = data.get("hourly", {}) if isinstance(data, dict) else {}
+    times = hourly.get("time", [])
+    temps = hourly.get("temperature_2m", [])
+    winds = hourly.get("wind_speed_10m", [])
+    codes = hourly.get("weather_code", [])
+    if not times or not temps:
+        return None
+
+    time_to_idx = {t[:16]: i for i, t in enumerate(times)}
+    result: dict[str, str] = {}
+    for title, hour in _DAY_SLOTS.items():
+        idx = time_to_idx.get(f"{today_str}T{hour:02d}:00")
+        if idx is not None and idx < len(temps) and temps[idx] is not None:
+            t_val = round(temps[idx])
+            w_val = round(winds[idx]) if idx < len(winds) and winds[idx] is not None else 0
+            c_val = codes[idx] if idx < len(codes) and codes[idx] is not None else 0
+            result[title] = f"{t_val}°C, {WEATHER_CODES.get(c_val, 'ясно')}, ветер {w_val} м/с"
+        else:
+            result[title] = NO_DATA
+    return result if _has_data(result) else None
+
+
+def parse_wttr_day(data: dict) -> dict[str, str] | None:
+    """Утро/день/вечер из ответа wttr.in (format=j1): слоты по 3 часа с полем time 900/1500/2100."""
+    try:
+        hourly = data["weather"][0]["hourly"]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+    by_time = {str(slot.get("time")): slot for slot in hourly if isinstance(slot, dict)}
+    result: dict[str, str] = {}
+    for title, hour in _DAY_SLOTS.items():
+        slot = by_time.get(str(hour * 100))
+        if not slot or slot.get("tempC") in (None, ""):
+            result[title] = NO_DATA
+            continue
+        lang_ru = slot.get("lang_ru") or slot.get("weatherDesc") or [{}]
+        desc = (lang_ru[0].get("value") or "ясно").strip().lower()
+        try:
+            wind = round(float(slot.get("windspeedKmph", 0)) / 3.6)
+        except (TypeError, ValueError):
+            wind = 0
+        result[title] = f"{slot['tempC']}°C, {desc}, ветер {wind} м/с"
+    return result if _has_data(result) else None
+
+
+async def _fetch_open_meteo(lat: float, lon: float) -> dict | None:
+    """Сырой ответ Open-Meteo или None (с понятной записью в лог, почему не вышло)."""
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat}&longitude={lon}"
+        "&hourly=temperature_2m,weather_code,wind_speed_10m"
+        "&wind_speed_unit=ms&forecast_days=2&timezone=auto"
+    )
+    headers = {"User-Agent": "TelegramWeatherBot/2.0 (Mozilla/5.0)"}
+    session = await get_http_session()
+    for attempt in range(2):
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            body = (await resp.text())[:200]
+            logging.warning(f"Open-Meteo ответил {resp.status} ({lat}, {lon}): {body}")
+            if resp.status != 429:
+                return None
+        await asyncio.sleep(2 * (attempt + 1))
+    return None
+
+
+async def _fetch_wttr(lat: float, lon: float) -> dict | None:
+    """Сырой ответ wttr.in (запасной источник) или None."""
+    session = await get_http_session()
+    url = f"https://wttr.in/{lat},{lon}?format=j1&lang=ru"
+    async with session.get(
+        url, headers={"User-Agent": "curl/8.0"}, timeout=aiohttp.ClientTimeout(total=10)
+    ) as resp:
+        if resp.status != 200:
+            logging.warning(f"wttr.in ответил {resp.status} ({lat}, {lon})")
+            return None
+        return await resp.json(content_type=None)
+
+
 async def get_weather_day(lat: float, lon: float, tz: ZoneInfo = TZ) -> dict[str, str]:
+    """Погода на утро, день и вечер для утреннего поста.
+
+    Сначала Open-Meteo, при отказе — wttr.in. Раньше запасного источника не было:
+    когда Open-Meteo отказывал серверу Render (лимит 429 на общий адрес хостинга),
+    в посте было «нет данных» во всех строках.
+    """
     today_str = datetime.now(tz).strftime("%Y-%m-%d")
     cache_key = f"day:{lat}:{lon}:{today_str}"
 
@@ -88,72 +189,24 @@ async def get_weather_day(lat: float, lon: float, tz: ZoneInfo = TZ) -> dict[str
     if cached is not None:
         return cached
 
-    url = (
-        "https://api.open-meteo.com/v1/forecast"
-        f"?latitude={lat}&longitude={lon}"
-        "&hourly=temperature_2m,weather_code,wind_speed_10m"
-        "&wind_speed_unit=ms"
-        "&forecast_days=2"
-        "&timezone=auto"
+    sources = (
+        ("Open-Meteo", _fetch_open_meteo, lambda data: parse_open_meteo_day(data, today_str)),
+        ("wttr.in", _fetch_wttr, parse_wttr_day),
     )
-    fallback = {
-        "🌅 Утро": "нет данных",
-        "☀️ День": "нет данных",
-        "🌆 Вечер": "нет данных",
-    }
-    headers = {"User-Agent": "TelegramWeatherBot/2.0 (Mozilla/5.0)"}
+    for name, fetch, parse in sources:
+        try:
+            data = await fetch(lat, lon)
+            result = parse(data) if data else None
+        except Exception as e:
+            logging.warning(f"Погода из {name} не получена ({lat}, {lon}): {e}")
+            continue
+        if result:
+            set_cached_weather(cache_key, result)
+            return result
+        logging.warning(f"{name}: нет данных на сегодня ({lat}, {lon})")
 
-    try:
-        session = await get_http_session()
-        data = None
-        for attempt in range(3):
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    break
-                if resp.status == 429:
-                    wait_sec = (attempt + 1) * 2
-                    logging.warning(f"Open-Meteo 429 (лимит). Ждем {wait_sec} сек...")
-                    await asyncio.sleep(wait_sec)
-                else:
-                    logging.error(f"Open-Meteo error status ({lat}, {lon}): {resp.status}")
-                    return get_last_known_weather(cache_key) or fallback
-
-        if not data:
-            return get_last_known_weather(cache_key) or fallback
-
-        hourly = data.get("hourly", {})
-        times = hourly.get("time", [])
-        temps = hourly.get("temperature_2m", [])
-        winds = hourly.get("wind_speed_10m", [])
-        codes = hourly.get("weather_code", [])
-
-        if not times or not temps:
-            return get_last_known_weather(cache_key) or fallback
-
-        # Индекс времени для O(1) поиска вместо линейного перебора
-        time_to_idx = {t[:16]: i for i, t in enumerate(times)}
-        target_hours = {"🌅 Утро": 9, "☀️ День": 15, "🌆 Вечер": 21}
-
-        result: dict[str, str] = {}
-        for title, hour in target_hours.items():
-            key_time = f"{today_str}T{hour:02d}:00"
-            idx = time_to_idx.get(key_time)
-            if idx is not None and idx < len(temps) and temps[idx] is not None:
-                t_val = round(temps[idx])
-                w_val = round(winds[idx]) if idx < len(winds) and winds[idx] is not None else 0
-                c_val = codes[idx] if idx < len(codes) and codes[idx] is not None else 0
-                weather_desc = WEATHER_CODES.get(c_val, "ясно")
-                result[title] = f"{t_val}°C, {weather_desc}, ветер {w_val} м/с"
-            else:
-                result[title] = "нет данных"
-
-        set_cached_weather(cache_key, result)
-        return result
-
-    except Exception as e:
-        logging.error(f"Ошибка получения погоды ({lat}, {lon}): {e}")
-        return get_last_known_weather(cache_key) or fallback
+    logging.error(f"Погода недоступна из всех источников ({lat}, {lon})")
+    return get_last_known_weather(cache_key) or _empty_day()
 
 
 def _resolve_location(
@@ -220,10 +273,11 @@ async def fetch_dynamic_weather(query_text: str, user: types.User | None = None)
     session = await get_http_session()
     headers = {"User-Agent": "Mozilla/5.0"}
     encoded_loc = quote(target_loc, safe=",")
-    url_wttr = f"https://wttr.in/{encoded_loc}?format=j1"
+    # lang=ru обязателен: без него wttr.in не отдаёт описание по-русски и бот всегда писал «ясно»
+    url_wttr = f"https://wttr.in/{encoded_loc}?format=j1&lang=ru"
 
     try:
-        async with session.get(url_wttr, headers=headers, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+        async with session.get(url_wttr, headers=headers, timeout=aiohttp.ClientTimeout(total=6)) as resp:
             if resp.status == 200:
                 data = await resp.json(content_type=None)
                 cur = data.get("current_condition", [{}])[0]
